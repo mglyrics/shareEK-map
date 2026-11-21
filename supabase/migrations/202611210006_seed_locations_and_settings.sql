@@ -101,7 +101,7 @@ FROM (
     ((SELECT id FROM gov WHERE slug = 'red-sea'), 'الغردقة', 'Hurghada', 'hurghada', false, 1),
     -- Upper Egypt
     ((SELECT id FROM gov WHERE slug = 'fayoum'), 'الفيوم الجديدة', 'New Fayoum', 'new-fayoum', true, 1),
-    ((SELECT id FROM gov WHERE slug = 'bani-suef'), 'بني سويف الجديدة', 'New Beni Suef', 'new-beni-suef', true, 1),
+    ((SELECT id FROM gov WHERE slug = 'beni-suef'), 'بني سويف الجديدة', 'New Beni Suef', 'new-beni-suef', true, 1),
     ((SELECT id FROM gov WHERE slug = 'minya'), 'المنيا الجديدة', 'New Minya', 'new-minya', true, 1),
     ((SELECT id FROM gov WHERE slug = 'asyut'), 'أسيوط الجديدة', 'New Asyut', 'new-asyut', true, 1),
     ((SELECT id FROM gov WHERE slug = 'sohag'), 'سوهاج الجديدة', 'New Sohag', 'new-sohag', true, 1),

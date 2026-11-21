@@ -222,10 +222,10 @@ BEGIN
     caller_is_admin := true;
   END IF;
 
-  SELECT COALESCE((value ->> 'days')::integer, 7)
-  INTO free_days
-  FROM public.site_settings
-  WHERE key = 'free_listing_days';
+  free_days := COALESCE(
+    (SELECT (value ->> 'days')::integer FROM public.site_settings WHERE key = 'free_listing_days'),
+    7
+  );
 
   IF TG_OP = 'INSERT' THEN
     IF NOT caller_is_admin THEN
@@ -390,10 +390,10 @@ BEGIN
     RAISE EXCEPTION 'Property not found';
   END IF;
 
-  SELECT COALESCE((value ->> 'days')::integer, 7)
-  INTO free_days
-  FROM public.site_settings
-  WHERE key = 'free_listing_days';
+  free_days := COALESCE(
+    (SELECT (value ->> 'days')::integer FROM public.site_settings WHERE key = 'free_listing_days'),
+    7
+  );
 
   UPDATE public.properties
   SET
