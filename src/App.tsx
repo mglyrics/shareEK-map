@@ -17,6 +17,7 @@ import {
   LoginPage,
   MemberSectionPage,
   RegisterPage,
+  ResetPasswordPage,
   VerifyEmailPage,
 } from './pages/MemberAndAdPages';
 import { NotFoundPage } from './pages/NotFoundPage';
@@ -41,6 +42,7 @@ export default function App() {
             <Route path="/register" element={<RegisterPage />} />
             <Route path="/login" element={<LoginPage />} />
             <Route path="/verify-email" element={<VerifyEmailPage />} />
+            <Route path="/reset-password" element={<ResetPasswordPage />} />
             <Route
               path="/dashboard"
               element={
