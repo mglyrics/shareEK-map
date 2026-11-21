@@ -164,6 +164,39 @@ describe('ShareEK Phase 02 - Database Migrations, RLS & Security Verification', 
       expect(content).not.toContain('VITE_SUPABASE_SERVICE_ROLE');
     }
   });
+
+  it('hardens Migration 0002 functions with empty search_path, zero current_user reliance, and integrity locks', () => {
+    const coreTablesSql = fs.readFileSync(
+      path.join(MIGRATIONS_DIR, '202611210002_core_tables.sql'),
+      'utf8'
+    );
+    const verificationSql = fs.readFileSync(
+      path.join(ROOT, 'supabase', 'tests', 'rls_and_lifecycle_verification.sql'),
+      'utf8'
+    );
+
+    expect(coreTablesSql).not.toMatch(/\bcurrent_user\b/i);
+    expect(coreTablesSql).not.toMatch(/pg_catalog\.(coalesce|nullif)/i);
+    expect(coreTablesSql).toContain("SET search_path = ''");
+    expect(coreTablesSql).toContain('COALESCE(NULLIF(auth.role()');
+    expect(coreTablesSql).toContain("pg_catalog.current_setting('role', true)");
+    expect(coreTablesSql).toContain('pg_catalog.now()');
+    expect(coreTablesSql).toContain("active_db_role = 'service_role'");
+    expect(coreTablesSql).toContain("jwt_role = 'service_role'");
+    expect(coreTablesSql).toContain('is_official_verified boolean NOT NULL DEFAULT false');
+    expect(coreTablesSql).toContain('trg_admin_logs_immutable');
+    expect(coreTablesSql).toContain('trg_payment_orders_no_delete');
+    expect(coreTablesSql).toContain('FOR UPDATE');
+    expect(coreTablesSql).toContain('REVOKE ALL ON FUNCTION public.enforce_project_verification_authorization() FROM PUBLIC, anon, authenticated');
+
+    // SQL security test suite explicitly covers anon, member, suspended/banned admin, active admin, and service_role
+    expect(verificationSql).toContain('SET LOCAL ROLE anon');
+    expect(verificationSql).toContain('SET LOCAL ROLE authenticated');
+    expect(verificationSql).toContain('SET LOCAL ROLE service_role');
+    expect(verificationSql).toContain('u_suspended_admin');
+    expect(verificationSql).toContain('u_banned_admin');
+    expect(verificationSql).toContain('u_admin');
+  });
 });
 
 // Live Supabase Database Integration Tests (executed only when credentials are configured)

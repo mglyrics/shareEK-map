@@ -48,6 +48,7 @@ CREATE INDEX IF NOT EXISTS idx_locations_level_active ON public.locations(level,
 CREATE OR REPLACE FUNCTION public.validate_location_parent_level()
 RETURNS trigger
 LANGUAGE plpgsql
+SET search_path = ''
 AS $$
 DECLARE
   parent_level public.location_level_enum;
@@ -56,28 +57,72 @@ BEGIN
     IF NEW.parent_id IS NOT NULL THEN
       RAISE EXCEPTION 'Governorate locations cannot have a parent_id';
     END IF;
-    RETURN NEW;
+  ELSE
+    SELECT level INTO parent_level
+    FROM public.locations
+    WHERE id = NEW.parent_id;
+
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'Parent location % not found', NEW.parent_id;
+    END IF;
+
+    IF NEW.level = 'city' AND parent_level <> 'governorate' THEN
+      RAISE EXCEPTION 'City must belong to a governorate (got parent level: %)', parent_level;
+    ELSIF NEW.level = 'district' AND parent_level <> 'city' THEN
+      RAISE EXCEPTION 'District must belong to a city (got parent level: %)', parent_level;
+    ELSIF NEW.level = 'area' AND parent_level <> 'district' THEN
+      RAISE EXCEPTION 'Area must belong to a district (got parent level: %)', parent_level;
+    END IF;
   END IF;
 
-  SELECT level INTO parent_level
-  FROM public.locations
-  WHERE id = NEW.parent_id;
+  -- Prevent downward or cross-table hierarchy corruption on existing location updates
+  IF TG_OP = 'UPDATE' THEN
+    IF NEW.level IS DISTINCT FROM OLD.level THEN
+      IF EXISTS (SELECT 1 FROM public.locations c WHERE c.parent_id = OLD.id) THEN
+        RAISE EXCEPTION 'Cannot change level of location % while child locations exist', OLD.id;
+      END IF;
 
-  IF NOT FOUND THEN
-    RAISE EXCEPTION 'Parent location % not found', NEW.parent_id;
-  END IF;
+      IF EXISTS (
+        SELECT 1 FROM public.properties p
+        WHERE p.governorate_id = OLD.id OR p.city_id = OLD.id OR p.district_id = OLD.id
+      ) THEN
+        RAISE EXCEPTION 'Cannot change level of location % while referenced by properties', OLD.id;
+      END IF;
 
-  IF NEW.level = 'city' AND parent_level <> 'governorate' THEN
-    RAISE EXCEPTION 'City must belong to a governorate (got parent level: %)', parent_level;
-  ELSIF NEW.level = 'district' AND parent_level <> 'city' THEN
-    RAISE EXCEPTION 'District must belong to a city (got parent level: %)', parent_level;
-  ELSIF NEW.level = 'area' AND parent_level <> 'district' THEN
-    RAISE EXCEPTION 'Area must belong to a district (got parent level: %)', parent_level;
+      IF EXISTS (
+        SELECT 1 FROM public.projects pr
+        WHERE pr.governorate_id = OLD.id OR pr.city_id = OLD.id
+      ) THEN
+        RAISE EXCEPTION 'Cannot change level of location % while referenced by projects', OLD.id;
+      END IF;
+    END IF;
+
+    IF NEW.parent_id IS DISTINCT FROM OLD.parent_id THEN
+      IF OLD.level = 'city' AND (
+        EXISTS (
+          SELECT 1 FROM public.properties p
+          WHERE p.city_id = OLD.id AND p.governorate_id IS DISTINCT FROM NEW.parent_id
+        )
+        OR EXISTS (
+          SELECT 1 FROM public.projects pr
+          WHERE pr.city_id = OLD.id AND pr.governorate_id IS DISTINCT FROM NEW.parent_id
+        )
+      ) THEN
+        RAISE EXCEPTION 'Cannot change parent governorate of city % while properties or projects reference it under another governorate', OLD.id;
+      ELSIF OLD.level = 'district' AND EXISTS (
+        SELECT 1 FROM public.properties p
+        WHERE p.district_id = OLD.id AND p.city_id IS DISTINCT FROM NEW.parent_id
+      ) THEN
+        RAISE EXCEPTION 'Cannot change parent city of district % while properties reference it under another city', OLD.id;
+      END IF;
+    END IF;
   END IF;
 
   RETURN NEW;
 END;
 $$;
+
+REVOKE ALL ON FUNCTION public.validate_location_parent_level() FROM PUBLIC, anon, authenticated;
 
 DROP TRIGGER IF EXISTS trg_validate_location_parent_level ON public.locations;
 CREATE TRIGGER trg_validate_location_parent_level
@@ -138,6 +183,7 @@ CREATE INDEX IF NOT EXISTS idx_properties_title_trgm ON public.properties USING 
 CREATE OR REPLACE FUNCTION public.validate_property_location_hierarchy()
 RETURNS trigger
 LANGUAGE plpgsql
+SET search_path = ''
 AS $$
 DECLARE
   gov_rec record;
@@ -180,6 +226,8 @@ BEGIN
 END;
 $$;
 
+REVOKE ALL ON FUNCTION public.validate_property_location_hierarchy() FROM PUBLIC, anon, authenticated;
+
 DROP TRIGGER IF EXISTS trg_validate_property_location_hierarchy ON public.properties;
 CREATE TRIGGER trg_validate_property_location_hierarchy
   BEFORE INSERT OR UPDATE OF governorate_id, city_id, district_id ON public.properties
@@ -209,6 +257,7 @@ CREATE INDEX IF NOT EXISTS idx_property_media_property_id ON public.property_med
 CREATE OR REPLACE FUNCTION public.enforce_max_property_media()
 RETURNS trigger
 LANGUAGE plpgsql
+SET search_path = ''
 AS $$
 DECLARE
   media_count integer;
@@ -227,7 +276,7 @@ BEGIN
     RAISE EXCEPTION 'Property % not found', NEW.property_id;
   END IF;
 
-  SELECT count(*) INTO media_count
+  SELECT pg_catalog.count(*) INTO media_count
   FROM public.property_media
   WHERE property_id = NEW.property_id;
 
@@ -238,6 +287,8 @@ BEGIN
   RETURN NEW;
 END;
 $$;
+
+REVOKE ALL ON FUNCTION public.enforce_max_property_media() FROM PUBLIC, anon, authenticated;
 
 DROP TRIGGER IF EXISTS trg_enforce_max_property_media ON public.property_media;
 CREATE TRIGGER trg_enforce_max_property_media
@@ -296,11 +347,15 @@ CREATE TABLE IF NOT EXISTS public.projects (
   status public.project_status_enum NOT NULL DEFAULT 'announced',
   cover_image_path text,
   is_official_verified boolean NOT NULL DEFAULT false,
-  verified_by uuid REFERENCES public.profiles(id) ON DELETE SET NULL,
+  verified_by uuid REFERENCES public.profiles(id) ON DELETE RESTRICT,
   verified_at timestamptz,
   created_by uuid REFERENCES public.profiles(id) ON DELETE SET NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
-  updated_at timestamptz NOT NULL DEFAULT now()
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT chk_projects_verification_metadata CHECK (
+    (is_official_verified = false AND verified_by IS NULL AND verified_at IS NULL)
+    OR (is_official_verified = true AND verified_by IS NOT NULL AND verified_at IS NOT NULL)
+  )
 );
 
 CREATE INDEX IF NOT EXISTS idx_projects_governorate ON public.projects(governorate_id);
@@ -311,6 +366,7 @@ CREATE INDEX IF NOT EXISTS idx_projects_verified ON public.projects(is_official_
 CREATE OR REPLACE FUNCTION public.validate_project_location_hierarchy()
 RETURNS trigger
 LANGUAGE plpgsql
+SET search_path = ''
 AS $$
 DECLARE
   gov_rec record;
@@ -337,6 +393,8 @@ BEGIN
   RETURN NEW;
 END;
 $$;
+
+REVOKE ALL ON FUNCTION public.validate_project_location_hierarchy() FROM PUBLIC, anon, authenticated;
 
 DROP TRIGGER IF EXISTS trg_validate_project_location_hierarchy ON public.projects;
 CREATE TRIGGER trg_validate_project_location_hierarchy
@@ -404,11 +462,14 @@ CREATE INDEX IF NOT EXISTS idx_payment_orders_property_id ON public.payment_orde
 CREATE OR REPLACE FUNCTION public.prevent_payment_orders_delete()
 RETURNS trigger
 LANGUAGE plpgsql
+SET search_path = ''
 AS $$
 BEGIN
   RAISE EXCEPTION 'payment_orders records cannot be deleted; mark status as cancelled instead';
 END;
 $$;
+
+REVOKE ALL ON FUNCTION public.prevent_payment_orders_delete() FROM PUBLIC, anon, authenticated;
 
 DROP TRIGGER IF EXISTS trg_payment_orders_no_delete ON public.payment_orders;
 CREATE TRIGGER trg_payment_orders_no_delete
@@ -447,17 +508,129 @@ CREATE TABLE IF NOT EXISTS public.admin_roles (
 
 CREATE INDEX IF NOT EXISTS idx_admin_roles_role_active ON public.admin_roles(role, is_active);
 
--- 13. admin_logs (Strictly append-only immutable audit log)
+-- Enforce strict database-level authorization for official project verification
+CREATE OR REPLACE FUNCTION public.enforce_project_verification_authorization()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  caller_uid uuid := auth.uid();
+  jwt_role text := COALESCE(NULLIF(auth.role(), ''), '');
+  active_db_role text := COALESCE(NULLIF(pg_catalog.current_setting('role', true), ''), '');
+  is_service_role boolean := (
+    caller_uid IS NULL
+    AND jwt_role = 'service_role'
+    AND active_db_role = 'service_role'
+  );
+  caller_is_admin boolean := false;
+  verifier_is_admin boolean := false;
+  verification_changed boolean := false;
+BEGIN
+  -- Strictly resolve caller authority from Supabase auth.uid() or verified service_role JWT + DB role.
+  -- Do not inspect session/owner role inside SECURITY DEFINER, and never treat anonymous (NULL auth.uid()) as admin.
+  IF caller_uid IS NOT NULL AND jwt_role = 'authenticated' THEN
+    SELECT EXISTS (
+      SELECT 1
+      FROM public.admin_roles ar
+      JOIN public.profiles p ON p.id = ar.user_id
+      WHERE ar.user_id = caller_uid
+        AND ar.is_active = true
+        AND ar.role IN ('super_admin', 'admin')
+        AND p.is_banned = false
+        AND p.is_suspended = false
+    ) INTO caller_is_admin;
+  END IF;
+
+  IF TG_OP = 'INSERT' THEN
+    verification_changed := (
+      NEW.is_official_verified = true
+      OR NEW.verified_by IS NOT NULL
+      OR NEW.verified_at IS NOT NULL
+    );
+  ELSE
+    verification_changed := (
+      NEW.is_official_verified IS DISTINCT FROM OLD.is_official_verified
+      OR NEW.verified_by IS DISTINCT FROM OLD.verified_by
+      OR NEW.verified_at IS DISTINCT FROM OLD.verified_at
+    );
+  END IF;
+
+  IF verification_changed AND NOT caller_is_admin AND NOT is_service_role THEN
+    RAISE EXCEPTION 'Unauthorized: Only active administrators may verify or alter official project verification status';
+  END IF;
+
+  -- Only enforce/populate verification metadata on INSERT or when verification fields change
+  IF TG_OP = 'INSERT' OR verification_changed THEN
+    IF NEW.is_official_verified = true THEN
+      IF caller_is_admin AND NOT is_service_role THEN
+        -- Authenticated active admin: bind verified_by to actual auth.uid() and record timestamp
+        IF TG_OP = 'INSERT' OR OLD.is_official_verified = false THEN
+          NEW.verified_by := caller_uid;
+          NEW.verified_at := pg_catalog.now();
+        ELSE
+          NEW.verified_by := OLD.verified_by;
+          NEW.verified_at := OLD.verified_at;
+        END IF;
+      ELSIF is_service_role THEN
+        -- Independent service_role path: require verified_by to reference an active super_admin/admin
+        IF NEW.verified_by IS NULL THEN
+          RAISE EXCEPTION 'verified_by must reference an authorized administrator when verifying a project';
+        END IF;
+
+        SELECT EXISTS (
+          SELECT 1
+          FROM public.admin_roles ar
+          JOIN public.profiles p ON p.id = ar.user_id
+          WHERE ar.user_id = NEW.verified_by
+            AND ar.is_active = true
+            AND ar.role IN ('super_admin', 'admin')
+            AND p.is_banned = false
+            AND p.is_suspended = false
+        ) INTO verifier_is_admin;
+
+        IF NOT verifier_is_admin THEN
+          RAISE EXCEPTION 'verified_by (%) is not an active authorized administrator', NEW.verified_by;
+        END IF;
+
+        IF TG_OP = 'INSERT' OR OLD.is_official_verified = false THEN
+          NEW.verified_at := pg_catalog.now();
+        ELSE
+          NEW.verified_by := OLD.verified_by;
+          NEW.verified_at := OLD.verified_at;
+        END IF;
+      ELSE
+        RAISE EXCEPTION 'Unauthorized: Official project verification requires an authorized administrator';
+      END IF;
+    ELSE
+      NEW.verified_by := NULL;
+      NEW.verified_at := NULL;
+    END IF;
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.enforce_project_verification_authorization() FROM PUBLIC, anon, authenticated;
+
+DROP TRIGGER IF EXISTS trg_enforce_project_verification ON public.projects;
+CREATE TRIGGER trg_enforce_project_verification
+  BEFORE INSERT OR UPDATE ON public.projects
+  FOR EACH ROW
+  EXECUTE FUNCTION public.enforce_project_verification_authorization();
+
+-- 13. admin_logs (Strictly append-only immutable audit log; historical actor_id preserved via RESTRICT)
 CREATE TABLE IF NOT EXISTS public.admin_logs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  actor_id uuid REFERENCES public.profiles(id) ON DELETE SET NULL,
+  actor_id uuid REFERENCES public.profiles(id) ON DELETE RESTRICT,
   actor_role public.admin_role_enum,
   action text NOT NULL CHECK (char_length(trim(action)) >= 2),
   target_table text NOT NULL CHECK (char_length(trim(target_table)) >= 2),
   target_id uuid,
   metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  updated_at timestamptz NOT NULL DEFAULT now()
+  created_at timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS idx_admin_logs_created_at ON public.admin_logs(created_at DESC);
@@ -466,6 +639,7 @@ CREATE INDEX IF NOT EXISTS idx_admin_logs_actor_id ON public.admin_logs(actor_id
 CREATE OR REPLACE FUNCTION public.prevent_admin_logs_mutation()
 RETURNS trigger
 LANGUAGE plpgsql
+SET search_path = ''
 AS $$
 BEGIN
   IF TG_TABLE_NAME = 'admin_logs' THEN
@@ -474,6 +648,8 @@ BEGIN
   RETURN NULL;
 END;
 $$;
+
+REVOKE ALL ON FUNCTION public.prevent_admin_logs_mutation() FROM PUBLIC, anon, authenticated;
 
 DROP TRIGGER IF EXISTS trg_admin_logs_immutable ON public.admin_logs;
 CREATE TRIGGER trg_admin_logs_immutable
