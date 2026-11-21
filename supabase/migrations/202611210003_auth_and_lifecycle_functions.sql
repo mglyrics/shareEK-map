@@ -252,8 +252,8 @@ BEGIN
       NEW.expires_at := OLD.expires_at;
       NEW.rejection_reason := OLD.rejection_reason;
 
-      IF OLD.status IN ('suspended', 'rejected') AND NEW.status = 'published' THEN
-        RAISE EXCEPTION 'Moderated listings require administrator approval to republish';
+      IF OLD.status IN ('suspended', 'rejected', 'expired') AND NEW.status = 'published' THEN
+        RAISE EXCEPTION 'Moderated or expired listings require administrator approval or renewal to republish';
       END IF;
 
       IF OLD.plan_type = 'free' AND NEW.status = 'published' AND OLD.status <> 'published' THEN
@@ -479,3 +479,13 @@ WHERE p.is_banned = false
   AND p.is_suspended = false;
 
 GRANT SELECT ON public.public_advertiser_summary TO anon, authenticated;
+
+REVOKE ALL ON FUNCTION public.approve_payment_order(uuid, text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.approve_payment_order(uuid, text) TO authenticated;
+
+REVOKE ALL ON FUNCTION public.moderate_property(uuid, public.listing_status_enum, text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.moderate_property(uuid, public.listing_status_enum, text) TO authenticated;
+
+REVOKE ALL ON FUNCTION public.expire_listings_batch() FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.expire_listings_batch() TO service_role;
+

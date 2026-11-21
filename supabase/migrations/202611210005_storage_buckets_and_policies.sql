@@ -1,7 +1,7 @@
 -- ShareEK - شريك العقاري
 -- Migration 0005: Storage Buckets and Storage Object RLS Policies
 
--- 1. Create Buckets
+-- 1. Create Buckets (idempotent upsert)
 INSERT INTO storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
 VALUES
   (
@@ -33,6 +33,7 @@ ON CONFLICT (id) DO UPDATE SET
 -- 2. Storage Policies for 'property-images'
 -- Public visitors can read images ONLY if they belong to an approved/published (non-expired) listing.
 -- Owners can read their own folder prefix; active admins can read all.
+DROP POLICY IF EXISTS "property_images_select_approved_or_owner_or_admin" ON storage.objects;
 CREATE POLICY "property_images_select_approved_or_owner_or_admin"
   ON storage.objects FOR SELECT
   TO anon, authenticated
@@ -53,6 +54,7 @@ CREATE POLICY "property_images_select_approved_or_owner_or_admin"
   );
 
 -- Authenticated, email-verified, non-suspended users can upload into their own UID folder prefix
+DROP POLICY IF EXISTS "property_images_insert_verified_owner" ON storage.objects;
 CREATE POLICY "property_images_insert_verified_owner"
   ON storage.objects FOR INSERT
   TO authenticated
@@ -68,6 +70,7 @@ CREATE POLICY "property_images_insert_verified_owner"
     )
   );
 
+DROP POLICY IF EXISTS "property_images_update_owner_or_admin" ON storage.objects;
 CREATE POLICY "property_images_update_owner_or_admin"
   ON storage.objects FOR UPDATE
   TO authenticated
@@ -79,6 +82,7 @@ CREATE POLICY "property_images_update_owner_or_admin"
     )
   );
 
+DROP POLICY IF EXISTS "property_images_delete_owner_or_admin" ON storage.objects;
 CREATE POLICY "property_images_delete_owner_or_admin"
   ON storage.objects FOR DELETE
   TO authenticated
@@ -91,6 +95,7 @@ CREATE POLICY "property_images_delete_owner_or_admin"
   );
 
 -- 3. Storage Policies for 'property-documents' (Strictly Private)
+DROP POLICY IF EXISTS "property_documents_select_owner_or_admin" ON storage.objects;
 CREATE POLICY "property_documents_select_owner_or_admin"
   ON storage.objects FOR SELECT
   TO authenticated
@@ -102,6 +107,7 @@ CREATE POLICY "property_documents_select_owner_or_admin"
     )
   );
 
+DROP POLICY IF EXISTS "property_documents_insert_owner" ON storage.objects;
 CREATE POLICY "property_documents_insert_owner"
   ON storage.objects FOR INSERT
   TO authenticated
@@ -110,6 +116,7 @@ CREATE POLICY "property_documents_insert_owner"
     AND (storage.foldername(name))[1] = auth.uid()::text
   );
 
+DROP POLICY IF EXISTS "property_documents_delete_owner_or_admin" ON storage.objects;
 CREATE POLICY "property_documents_delete_owner_or_admin"
   ON storage.objects FOR DELETE
   TO authenticated
@@ -122,6 +129,7 @@ CREATE POLICY "property_documents_delete_owner_or_admin"
   );
 
 -- 4. Storage Policies for 'admin-reports' (Strictly Private to Authorized Admins)
+DROP POLICY IF EXISTS "admin_reports_select_admins" ON storage.objects;
 CREATE POLICY "admin_reports_select_admins"
   ON storage.objects FOR SELECT
   TO authenticated
@@ -133,6 +141,7 @@ CREATE POLICY "admin_reports_select_admins"
     )
   );
 
+DROP POLICY IF EXISTS "admin_reports_insert_admins" ON storage.objects;
 CREATE POLICY "admin_reports_insert_admins"
   ON storage.objects FOR INSERT
   TO authenticated
@@ -144,6 +153,7 @@ CREATE POLICY "admin_reports_insert_admins"
     )
   );
 
+DROP POLICY IF EXISTS "admin_reports_delete_admins" ON storage.objects;
 CREATE POLICY "admin_reports_delete_admins"
   ON storage.objects FOR DELETE
   TO authenticated
