@@ -156,7 +156,7 @@ CREATE TRIGGER trg_protect_profile_sensitive_columns
   FOR EACH ROW
   EXECUTE FUNCTION public.protect_profile_sensitive_columns();
 
--- 4. Enforce max 10 images per property listing
+-- 4. Enforce max 10 images per property listing (concurrency-safe via parent row lock)
 CREATE OR REPLACE FUNCTION public.enforce_max_property_media()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -164,6 +164,19 @@ AS $$
 DECLARE
   media_count integer;
 BEGIN
+  IF TG_OP = 'UPDATE' AND NEW.property_id = OLD.property_id THEN
+    RETURN NEW;
+  END IF;
+
+  PERFORM 1
+  FROM public.properties
+  WHERE id = NEW.property_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Property % not found', NEW.property_id;
+  END IF;
+
   SELECT count(*) INTO media_count
   FROM public.property_media
   WHERE property_id = NEW.property_id;
@@ -177,7 +190,7 @@ $$;
 
 DROP TRIGGER IF EXISTS trg_enforce_max_property_media ON public.property_media;
 CREATE TRIGGER trg_enforce_max_property_media
-  BEFORE INSERT ON public.property_media
+  BEFORE INSERT OR UPDATE OF property_id ON public.property_media
   FOR EACH ROW
   EXECUTE FUNCTION public.enforce_max_property_media();
 
