@@ -167,6 +167,7 @@ export interface Database {
           is_featured: boolean;
           published_at: string | null;
           expires_at: string | null;
+          archived_at: string | null;
           views_count: number;
           created_at: string;
           updated_at: string;
@@ -560,7 +561,38 @@ export interface Database {
       };
     };
     Functions: {
+      create_payment_order: {
+        Args: {
+          target_property_id: string;
+          requested_plan: DbListingPlan;
+          requested_duration_days: number;
+          transfer_reference_input?: string;
+          receipt_storage_path_input?: string;
+        };
+        Returns: string;
+      };
+      submit_payment_proof: {
+        Args: {
+          order_id: string;
+          transfer_reference_input: string;
+          receipt_storage_path_input?: string;
+        };
+        Returns: undefined;
+      };
+      cancel_payment_order: {
+        Args: {
+          order_id: string;
+        };
+        Returns: undefined;
+      };
       approve_payment_order: {
+        Args: {
+          order_id: string;
+          admin_notes_input?: string;
+        };
+        Returns: undefined;
+      };
+      reject_payment_order: {
         Args: {
           order_id: string;
           admin_notes_input?: string;
@@ -574,6 +606,41 @@ export interface Database {
           reason_input?: string;
         };
         Returns: undefined;
+      };
+      archive_own_property: {
+        Args: {
+          target_property_id: string;
+        };
+        Returns: undefined;
+      };
+      review_property_authorization: {
+        Args: {
+          auth_id: string;
+          new_status: 'verified' | 'rejected';
+          notes_input?: string;
+        };
+        Returns: undefined;
+      };
+      resolve_report: {
+        Args: {
+          report_id: string;
+          new_status: DbReportStatus;
+          resolution_notes_input?: string;
+        };
+        Returns: undefined;
+      };
+      get_reports_summary_stats: {
+        Args: Record<string, never>;
+        Returns: Json;
+      };
+      get_public_advertiser_summaries: {
+        Args: Record<string, never>;
+        Returns: Array<{
+          id: string;
+          full_name: string;
+          member_type: DbMemberType;
+          phone_verified: boolean;
+        }>;
       };
       is_active_admin: {
         Args: {

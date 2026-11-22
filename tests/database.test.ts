@@ -83,11 +83,11 @@ describe('ShareEK Phase 02 - Database Migrations, RLS & Security Verification', 
     expect(fullSql).toContain('public.set_updated_at()');
   });
 
-  it('defines relational foreign keys and constraints across tables', () => {
+  it('defines relational foreign keys and constraints across tables including ON DELETE RESTRICT retention', () => {
     expect(fullSql).toContain('REFERENCES auth.users(id) ON DELETE CASCADE');
     expect(fullSql).toContain('REFERENCES public.locations(id)');
-    expect(fullSql).toContain('REFERENCES public.profiles(id) ON DELETE CASCADE');
-    expect(fullSql).toContain('REFERENCES public.properties(id) ON DELETE CASCADE');
+    expect(fullSql).toContain('REFERENCES public.profiles(id) ON DELETE RESTRICT');
+    expect(fullSql).toContain('REFERENCES public.properties(id) ON DELETE RESTRICT');
     expect(fullSql).toContain('Maximum 10 images allowed per property listing');
     expect(fullSql).toContain('chk_locations_hierarchy');
     expect(fullSql).toContain('chk_properties_dates');
@@ -113,17 +113,51 @@ describe('ShareEK Phase 02 - Database Migrations, RLS & Security Verification', 
     expect(rlsSql).not.toMatch(/WITH\s+CHECK\s*\(\s*true\s*\)/i);
   });
 
-  it('enforces public property visibility, owner permissions, and admin-only payment approval', () => {
-    expect(fullSql).toContain('CREATE POLICY "properties_select_published_or_owner_or_admin"');
-    expect(fullSql).toContain('CREATE POLICY "properties_update_owner"');
-    expect(fullSql).toContain('CREATE POLICY "payment_orders_update_admin_only"');
-    expect(fullSql).toContain('CREATE POLICY "admin_roles_manage_super_admin_only"');
-    expect(fullSql).toContain('CREATE OR REPLACE FUNCTION public.approve_payment_order');
-    expect(fullSql).toContain('CREATE OR REPLACE FUNCTION public.moderate_property');
-    expect(fullSql).toContain('CREATE OR REPLACE FUNCTION public.expire_listings_batch');
+  it('enforces RBAC separation, payment/log/report/inquiry immutability, and trusted RPCs', () => {
+    const fnSql = fs.readFileSync(
+      path.join(MIGRATIONS_DIR, '202611210003_auth_and_lifecycle_functions.sql'),
+      'utf8'
+    );
+    const rlsSql = fs.readFileSync(
+      path.join(MIGRATIONS_DIR, '202611210004_rls_policies.sql'),
+      'utf8'
+    );
+
+    // Moderator isolated from direct properties UPDATE; reports_viewer excluded from is_active_admin & payment_orders
+    expect(rlsSql).toContain('CREATE POLICY "properties_update_admin_only"');
+    expect(rlsSql).not.toContain('CREATE POLICY "properties_update_admin_moderator"');
+    expect(rlsSql).not.toContain('CREATE POLICY "payment_orders_insert_own_pending"');
+    expect(rlsSql).not.toContain('CREATE POLICY "payment_orders_update_admin_only"');
+    expect(rlsSql).not.toContain('CREATE POLICY "admin_logs_insert_admins"');
+    expect(rlsSql).not.toContain('CREATE POLICY "property_authorizations_update_admin"');
+    expect(rlsSql).not.toContain('CREATE POLICY "reports_update_moderator_or_admin"');
+    expect(rlsSql).toContain('CREATE POLICY "admin_roles_manage_super_admin_only"');
+
+    // Trusted RPCs & immutability triggers in 0003 (and no duplicate enforce_max_property_media)
+    expect(fnSql).not.toContain('CREATE OR REPLACE FUNCTION public.enforce_max_property_media');
+    expect(fnSql).toContain("ar.role IN ('super_admin', 'admin')");
+    expect(fnSql).toContain('WITH (security_invoker = true, security_barrier = true)');
+    expect(fnSql).toContain('CREATE OR REPLACE FUNCTION public.create_payment_order');
+    expect(fnSql).toContain('CREATE OR REPLACE FUNCTION public.submit_payment_proof');
+    expect(fnSql).toContain('CREATE OR REPLACE FUNCTION public.cancel_payment_order');
+    expect(fnSql).toContain('CREATE OR REPLACE FUNCTION public.approve_payment_order');
+    expect(fnSql).toContain('CREATE OR REPLACE FUNCTION public.reject_payment_order');
+    expect(fnSql).toContain('CREATE OR REPLACE FUNCTION public.moderate_property');
+    expect(fnSql).toContain('CREATE OR REPLACE FUNCTION public.review_property_authorization');
+    expect(fnSql).toContain('CREATE OR REPLACE FUNCTION public.resolve_report');
+    expect(fnSql).toContain('CREATE OR REPLACE FUNCTION public.get_reports_summary_stats');
+    expect(fnSql).toContain('CREATE OR REPLACE FUNCTION public.expire_listings_batch');
+    expect(fnSql).toContain('trg_protect_payment_orders_integrity');
+    expect(fnSql).toContain('trg_protect_property_authorizations_integrity');
+    expect(fnSql).toContain('trg_protect_inquiries_immutability');
+    expect(fnSql).toContain('trg_protect_reports_immutability');
+    expect(fnSql).not.toMatch(/pg_catalog\.(coalesce|nullif)/i);
+
+    // Explicit super_admin/admin role arrays used instead of is_active_admin in 0004 & 0005
+    expect(rlsSql).not.toContain('is_active_admin');
   });
 
-  it('configures property-images, property-documents (private), and admin-reports (private) storage buckets', () => {
+  it('configures property-images (private), property-documents (private), and admin-reports (private) storage buckets', () => {
     const storageSql = fs.readFileSync(
       path.join(MIGRATIONS_DIR, '202611210005_storage_buckets_and_policies.sql'),
       'utf8'
@@ -131,8 +165,11 @@ describe('ShareEK Phase 02 - Database Migrations, RLS & Security Verification', 
     expect(storageSql).toContain("'property-images'");
     expect(storageSql).toContain("'property-documents'");
     expect(storageSql).toContain("'admin-reports'");
+    expect(storageSql).not.toContain('is_active_admin');
+    expect(storageSql).not.toMatch(/'property-images',\s*\n\s*true/i);
     expect(storageSql).toContain('property_images_select_approved_or_owner_or_admin');
     expect(storageSql).toContain('property_documents_select_owner_or_admin');
+    expect(storageSql).toContain("pa.verification_status = 'verified'");
     expect(storageSql).toContain('admin_reports_select_admins');
   });
 
@@ -189,10 +226,10 @@ describe('ShareEK Phase 02 - Database Migrations, RLS & Security Verification', 
     expect(coreTablesSql).toContain('FOR UPDATE');
     expect(coreTablesSql).toContain('REVOKE ALL ON FUNCTION public.enforce_project_verification_authorization() FROM PUBLIC, anon, authenticated');
 
-    // SQL security test suite explicitly covers anon, member, suspended/banned admin, active admin, and service_role
     expect(verificationSql).toContain('SET LOCAL ROLE anon');
     expect(verificationSql).toContain('SET LOCAL ROLE authenticated');
-    expect(verificationSql).toContain('SET LOCAL ROLE service_role');
+    expect(verificationSql).toContain('u_moderator');
+    expect(verificationSql).toContain('u_reports_viewer');
     expect(verificationSql).toContain('u_suspended_admin');
     expect(verificationSql).toContain('u_banned_admin');
     expect(verificationSql).toContain('u_admin');
@@ -220,7 +257,6 @@ describe.skipIf(!hasLiveSupabase)('ShareEK Live Supabase Integration Tests', () 
       .from('profiles')
       .select('id, email');
 
-    // Either RLS returns empty rows or permission denied; public visitors never receive member PII
     expect(profError || (profiles ?? []).length === 0).toBeTruthy();
   });
 
