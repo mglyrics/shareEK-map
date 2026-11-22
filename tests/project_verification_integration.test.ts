@@ -7,28 +7,57 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 const ROOT = path.resolve(__dirname, '..');
 const envTestLocalPath = path.join(ROOT, '.env.test.local');
 const envLocalPath = path.join(ROOT, '.env.local');
-if (fs.existsSync(envTestLocalPath)) {
-  dotenv.config({ path: envTestLocalPath, override: false, quiet: true });
-}
-if (fs.existsSync(envLocalPath)) {
-  dotenv.config({ path: envLocalPath, override: false, quiet: true });
+
+const testFileEnv = fs.existsSync(envTestLocalPath)
+  ? dotenv.parse(fs.readFileSync(envTestLocalPath, 'utf8'))
+  : {};
+const prodFileEnv = fs.existsSync(envLocalPath)
+  ? dotenv.parse(fs.readFileSync(envLocalPath, 'utf8'))
+  : {};
+
+function normalizeUrl(url: string): string {
+  return url.trim().replace(/\/+$/, '').toLowerCase();
 }
 
-const supabaseUrl =
-  process.env.TEST_SUPABASE_URL ?? process.env.VITE_SUPABASE_URL ?? '';
-const supabaseAnonKey =
-  process.env.TEST_SUPABASE_ANON_KEY ??
-  process.env.VITE_SUPABASE_ANON_KEY ??
-  process.env.SUPABASE_ANON_KEY ??
+// Read-only probe target (can safely check TEST_SUPABASE_URL or read-only VITE_SUPABASE_URL)
+const probeUrl =
+  process.env.TEST_SUPABASE_URL ||
+  testFileEnv.TEST_SUPABASE_URL ||
+  process.env.VITE_SUPABASE_URL ||
+  prodFileEnv.VITE_SUPABASE_URL ||
   '';
-const supabaseServiceRoleKey =
-  process.env.TEST_SUPABASE_SERVICE_ROLE_KEY ??
-  process.env.SUPABASE_SERVICE_ROLE_KEY ??
+const probeAnonKey =
+  process.env.TEST_SUPABASE_ANON_KEY ||
+  testFileEnv.TEST_SUPABASE_ANON_KEY ||
+  process.env.VITE_SUPABASE_ANON_KEY ||
+  prodFileEnv.VITE_SUPABASE_ANON_KEY ||
   '';
 
-const hasPublicSupabaseConfig = Boolean(supabaseUrl && supabaseAnonKey);
-const hasFullIntegrationCredentials = Boolean(
-  supabaseUrl && supabaseAnonKey && supabaseServiceRoleKey
+// Strict isolated target for mutating integration tests: NEVER falls back to production VITE_SUPABASE_*
+const testSupabaseUrl =
+  process.env.TEST_SUPABASE_URL || testFileEnv.TEST_SUPABASE_URL || '';
+const testSupabaseAnonKey =
+  process.env.TEST_SUPABASE_ANON_KEY || testFileEnv.TEST_SUPABASE_ANON_KEY || '';
+const testSupabaseServiceRoleKey =
+  process.env.TEST_SUPABASE_SERVICE_ROLE_KEY ||
+  testFileEnv.TEST_SUPABASE_SERVICE_ROLE_KEY ||
+  '';
+
+const productionUrl =
+  process.env.VITE_SUPABASE_URL || prodFileEnv.VITE_SUPABASE_URL || '';
+
+const isTargetingProduction = Boolean(
+  testSupabaseUrl &&
+    productionUrl &&
+    normalizeUrl(testSupabaseUrl) === normalizeUrl(productionUrl)
+);
+
+const hasPublicProbeConfig = Boolean(probeUrl && probeAnonKey);
+const hasIsolatedIntegrationEnv = Boolean(
+  testSupabaseUrl &&
+    testSupabaseAnonKey &&
+    testSupabaseServiceRoleKey &&
+    !isTargetingProduction
 );
 
 interface CreatedUser {
@@ -107,10 +136,12 @@ async function createConfirmedUserWithProfile(
 }
 
 async function signInIsolatedClient(
+  url: string,
+  anonKey: string,
   email: string,
   password: string
 ): Promise<SupabaseClient> {
-  const client = createClient(supabaseUrl, supabaseAnonKey, {
+  const client = createClient(url, anonKey, {
     auth: {
       autoRefreshToken: false,
       persistSession: false,
@@ -123,7 +154,7 @@ async function signInIsolatedClient(
   }
 
   // Return a PostgREST client pinned strictly to the signed-in user's JWT
-  return createClient(supabaseUrl, supabaseAnonKey, {
+  return createClient(url, anonKey, {
     auth: {
       autoRefreshToken: false,
       persistSession: false,
@@ -136,21 +167,20 @@ async function signInIsolatedClient(
   });
 }
 
-describe.skipIf(!hasPublicSupabaseConfig)(
-  'ShareEK Live Supabase PostgREST Readiness Probe',
+describe.skipIf(!hasPublicProbeConfig)(
+  'ShareEK Live Supabase PostgREST Readiness Probe (Read-Only)',
   () => {
-    it('probes live Supabase Auth and reports whether public.projects is deployed yet', async () => {
-      const authRes = await fetch(`${supabaseUrl}/auth/v1/settings`, {
-        headers: { apikey: supabaseAnonKey },
+    it('probes Supabase Auth and checks whether public.projects exists via PostgREST', async () => {
+      const authRes = await fetch(`${probeUrl}/auth/v1/settings`, {
+        headers: { apikey: probeAnonKey },
       });
       expect(authRes.ok).toBe(true);
 
-      const anonClient = createClient(supabaseUrl, supabaseAnonKey, {
+      const anonClient = createClient(probeUrl, probeAnonKey, {
         auth: { autoRefreshToken: false, persistSession: false },
       });
 
       const { error } = await anonClient.from('projects').select('id').limit(1);
-      // Either projects table exists (error === null) or PGRST205 before Migration 0002 is executed
       if (error) {
         expect(error.code).toBe('PGRST205');
       } else {
@@ -160,7 +190,13 @@ describe.skipIf(!hasPublicSupabaseConfig)(
   }
 );
 
-describe.skipIf(!hasFullIntegrationCredentials)(
+describe('ShareEK Test Environment Isolation Guard', () => {
+  it('guarantees mutating integration tests never target production VITE_SUPABASE_URL', () => {
+    expect(isTargetingProduction).toBe(false);
+  });
+});
+
+describe.skipIf(!hasIsolatedIntegrationEnv)(
   'ShareEK Live PostgREST Integration: enforce_project_verification_authorization()',
   () => {
     let serviceClient: SupabaseClient;
@@ -176,30 +212,41 @@ describe.skipIf(!hasFullIntegrationCredentials)(
     let bannedAdminUser: CreatedUser;
 
     let testGovernorateId: string;
+    let unverifiedProjectId: string;
     let createdTempGovernorate = false;
     const createdProjectIds: string[] = [];
     const createdUserIds: string[] = [];
 
     beforeAll(async () => {
-      serviceClient = createClient(supabaseUrl, supabaseServiceRoleKey, {
+      if (
+        !testSupabaseUrl ||
+        !testSupabaseAnonKey ||
+        !testSupabaseServiceRoleKey ||
+        isTargetingProduction
+      ) {
+        throw new Error(
+          'SAFETY ABORT: Mutating integration tests require an isolated TEST_SUPABASE_* project distinct from production.'
+        );
+      }
+
+      serviceClient = createClient(testSupabaseUrl, testSupabaseServiceRoleKey, {
         auth: { autoRefreshToken: false, persistSession: false },
       });
-      anonClient = createClient(supabaseUrl, supabaseAnonKey, {
+      anonClient = createClient(testSupabaseUrl, testSupabaseAnonKey, {
         auth: { autoRefreshToken: false, persistSession: false },
       });
 
-      // Confirm Migration 0002 tables exist before attempting mutations
+      // Confirm Migration 0002 tables exist in the isolated test project before testing
       const { error: schemaErr } = await serviceClient
         .from('projects')
         .select('id')
         .limit(1);
       if (schemaErr?.code === 'PGRST205') {
         throw new Error(
-          'Cannot run live project verification tests: public.projects does not exist yet (Migration 0002 not applied).'
+          'Cannot run live project verification tests: public.projects does not exist yet in the isolated test project (apply Migrations 0001-0004 to the test project first).'
         );
       }
 
-      // Resolve an existing governorate (e.g. from 0006) or create a temporary one for the test
       const { data: existingGov, error: govLookupErr } = await serviceClient
         .from('locations')
         .select('id')
@@ -208,7 +255,7 @@ describe.skipIf(!hasFullIntegrationCredentials)(
         .maybeSingle();
 
       if (govLookupErr) {
-        throw new Error(`Failed to query locations: ${govLookupErr.message}`);
+        throw new Error(`Failed to query locations in test project: ${govLookupErr.message}`);
       }
 
       if (existingGov?.id) {
@@ -266,30 +313,64 @@ describe.skipIf(!hasFullIntegrationCredentials)(
       });
       createdUserIds.push(bannedAdminUser.id);
 
-      memberClient = await signInIsolatedClient(memberUser.email, memberUser.password);
+      memberClient = await signInIsolatedClient(
+        testSupabaseUrl,
+        testSupabaseAnonKey,
+        memberUser.email,
+        memberUser.password
+      );
       activeAdminClient = await signInIsolatedClient(
+        testSupabaseUrl,
+        testSupabaseAnonKey,
         activeAdminUser.email,
         activeAdminUser.password
       );
       suspendedAdminClient = await signInIsolatedClient(
+        testSupabaseUrl,
+        testSupabaseAnonKey,
         suspendedAdminUser.email,
         suspendedAdminUser.password
       );
       bannedAdminClient = await signInIsolatedClient(
+        testSupabaseUrl,
+        testSupabaseAnonKey,
         bannedAdminUser.email,
         bannedAdminUser.password
       );
+
+      // Seed one unverified project row for UPDATE authorization tests across roles
+      const { data: draftProj, error: draftErr } = await serviceClient
+        .from('projects')
+        .insert({
+          authority: 'هيئة اختبارية',
+          project_name: 'مشروع غير معتمد لاختبار التعديل',
+          project_category: 'إسكان',
+          governorate_id: testGovernorateId,
+          announcement_reference: `TEST-UNVERIFIED-${Date.now()}`,
+          announcement_date: '2026-11-21',
+          official_source_url: 'https://share-ek.com',
+          description: 'مشروع غير معتمد مبدئيًا لاختبار منع التعديل غير المصرح به.',
+          is_official_verified: false,
+        })
+        .select('id')
+        .single();
+
+      if (draftErr || !draftProj) {
+        throw new Error(`Failed to create unverified test project: ${draftErr?.message}`);
+      }
+      unverifiedProjectId = draftProj.id;
+      createdProjectIds.push(unverifiedProjectId);
     }, 60000);
 
     afterAll(async () => {
       if (!serviceClient) return;
 
-      // 1. Delete test projects first (projects.verified_by uses ON DELETE RESTRICT)
+      // 1. Delete ONLY the test projects created in this run (projects.verified_by uses ON DELETE RESTRICT)
       if (createdProjectIds.length > 0) {
         await serviceClient.from('projects').delete().in('id', createdProjectIds);
       }
 
-      // 2. Delete test auth users (cascades to profiles & admin_roles)
+      // 2. Delete ONLY the temporary test auth users created in this run (cascades to profiles & admin_roles)
       for (const uid of createdUserIds) {
         await serviceClient.auth.admin.deleteUser(uid);
       }
@@ -300,7 +381,7 @@ describe.skipIf(!hasFullIntegrationCredentials)(
       }
     }, 30000);
 
-    it('1. rejects anonymous (anon) attempts to create or verify an official project via PostgREST', async () => {
+    it('1. rejects anonymous (anon) attempts to create or verify an official project via PostgREST (INSERT & UPDATE)', async () => {
       const ref = `TEST-ANON-${Date.now()}`;
       const { data, error } = await anonClient
         .from('projects')
@@ -320,9 +401,17 @@ describe.skipIf(!hasFullIntegrationCredentials)(
 
       expect(data).toBeNull();
       expect(error).not.toBeNull();
+
+      const { data: anonUpd, error: anonUpdErr } = await anonClient
+        .from('projects')
+        .update({ is_official_verified: true })
+        .eq('id', unverifiedProjectId)
+        .select('id');
+
+      expect(anonUpdErr !== null || (anonUpd ?? []).length === 0).toBe(true);
     });
 
-    it('2. rejects ordinary authenticated member attempts to verify an official project via PostgREST', async () => {
+    it('2. rejects ordinary authenticated member attempts to verify an official project via PostgREST (INSERT & UPDATE)', async () => {
       const ref = `TEST-MEM-${Date.now()}`;
       const { data, error } = await memberClient
         .from('projects')
@@ -344,9 +433,20 @@ describe.skipIf(!hasFullIntegrationCredentials)(
 
       expect(data).toBeNull();
       expect(error).not.toBeNull();
+
+      const { data: memUpd, error: memUpdErr } = await memberClient
+        .from('projects')
+        .update({
+          is_official_verified: true,
+          verified_by: memberUser.id,
+        })
+        .eq('id', unverifiedProjectId)
+        .select('id');
+
+      expect(memUpdErr !== null || (memUpd ?? []).length === 0).toBe(true);
     });
 
-    it('3. rejects suspended and banned admins from verifying an official project via PostgREST', async () => {
+    it('3. rejects suspended and banned admins from verifying an official project via PostgREST (INSERT & UPDATE)', async () => {
       const suspRef = `TEST-SUSP-${Date.now()}`;
       const { data: suspData, error: suspErr } = await suspendedAdminClient
         .from('projects')
@@ -367,6 +467,14 @@ describe.skipIf(!hasFullIntegrationCredentials)(
       expect(suspData).toBeNull();
       expect(suspErr).not.toBeNull();
 
+      const { data: suspUpd, error: suspUpdErr } = await suspendedAdminClient
+        .from('projects')
+        .update({ is_official_verified: true })
+        .eq('id', unverifiedProjectId)
+        .select('id');
+
+      expect(suspUpdErr !== null || (suspUpd ?? []).length === 0).toBe(true);
+
       const banRef = `TEST-BAN-${Date.now()}`;
       const { data: banData, error: banErr } = await bannedAdminClient
         .from('projects')
@@ -386,12 +494,18 @@ describe.skipIf(!hasFullIntegrationCredentials)(
 
       expect(banData).toBeNull();
       expect(banErr).not.toBeNull();
+
+      const { data: banUpd, error: banUpdErr } = await bannedAdminClient
+        .from('projects')
+        .update({ is_official_verified: true })
+        .eq('id', unverifiedProjectId)
+        .select('id');
+
+      expect(banUpdErr !== null || (banUpd ?? []).length === 0).toBe(true);
     });
 
-    it('4. allows active admin to verify project via PostgREST and forces verified_by = auth.uid() & verified_at = now()', async () => {
+    it('4. allows active admin to verify project via PostgREST (INSERT & UPDATE) and forces verified_by = auth.uid() & verified_at = now()', async () => {
       const ref = `TEST-ADM-${Date.now()}`;
-      // Deliberately attempt to spoof verified_by with memberUser.id and a stale timestamp;
-      // trigger must overwrite both with activeAdminUser.id and current DB time.
       const staleDate = '2020-01-01T00:00:00.000Z';
       const { data, error } = await activeAdminClient
         .from('projects')
@@ -419,10 +533,26 @@ describe.skipIf(!hasFullIntegrationCredentials)(
       expect(data!.verified_by).toBe(activeAdminUser.id);
       expect(data!.verified_at).not.toBeNull();
       expect(new Date(data!.verified_at).getFullYear()).toBeGreaterThanOrEqual(2026);
+
+      // Also test verifying the pre-created unverified project via UPDATE
+      const { data: verifiedDraft, error: draftUpdErr } = await activeAdminClient
+        .from('projects')
+        .update({
+          is_official_verified: true,
+          verified_by: memberUser.id,
+          verified_at: staleDate,
+        })
+        .eq('id', unverifiedProjectId)
+        .select('id, is_official_verified, verified_by, verified_at')
+        .single();
+
+      expect(draftUpdErr).toBeNull();
+      expect(verifiedDraft!.is_official_verified).toBe(true);
+      expect(verifiedDraft!.verified_by).toBe(activeAdminUser.id);
+      expect(new Date(verifiedDraft!.verified_at).getFullYear()).toBeGreaterThanOrEqual(2026);
     });
 
     it('5. allows service_role verification via PostgREST ONLY when verified_by is an active, non-banned, non-suspended admin', async () => {
-      // 5a. NULL verified_by must fail
       const { error: nullErr } = await serviceClient.from('projects').insert({
         authority: 'هيئة المجتمعات العمرانية الجديدة',
         project_name: 'مشروع خدمة بدون معرف موثق',
@@ -437,7 +567,6 @@ describe.skipIf(!hasFullIntegrationCredentials)(
       });
       expect(nullErr).not.toBeNull();
 
-      // 5b. Ordinary member as verified_by must fail
       const { error: memErr } = await serviceClient.from('projects').insert({
         authority: 'هيئة المجتمعات العمرانية الجديدة',
         project_name: 'مشروع خدمة بمعرف عضو عادي',
@@ -452,7 +581,6 @@ describe.skipIf(!hasFullIntegrationCredentials)(
       });
       expect(memErr).not.toBeNull();
 
-      // 5c. Suspended admin as verified_by must fail
       const { error: suspErr } = await serviceClient.from('projects').insert({
         authority: 'هيئة المجتمعات العمرانية الجديدة',
         project_name: 'مشروع خدمة بمعرف مسؤول موقوف',
@@ -467,7 +595,6 @@ describe.skipIf(!hasFullIntegrationCredentials)(
       });
       expect(suspErr).not.toBeNull();
 
-      // 5d. Banned admin as verified_by must fail
       const { error: banErr } = await serviceClient.from('projects').insert({
         authority: 'هيئة المجتمعات العمرانية الجديدة',
         project_name: 'مشروع خدمة بمعرف مسؤول محظور',
@@ -482,8 +609,6 @@ describe.skipIf(!hasFullIntegrationCredentials)(
       });
       expect(banErr).not.toBeNull();
 
-      // 5e. Valid active admin as verified_by must succeed (proving auth.role() = 'service_role'
-      //     AND pg_catalog.current_setting('role', true) = 'service_role' inside SECURITY DEFINER)
       const { data: okData, error: okErr } = await serviceClient
         .from('projects')
         .insert({
@@ -510,13 +635,13 @@ describe.skipIf(!hasFullIntegrationCredentials)(
     });
 
     it('6. permits normal operational updates on verified projects without resetting verification and blocks unauthorized changes', async () => {
-      const targetProjectId = createdProjectIds[0];
-      expect(targetProjectId).toBeTruthy();
+      const verifiedProjectId = createdProjectIds.find((id) => id !== unverifiedProjectId);
+      expect(verifiedProjectId).toBeTruthy();
 
       const { data: beforeRow, error: readErr } = await activeAdminClient
         .from('projects')
         .select('verified_by, verified_at, is_official_verified')
-        .eq('id', targetProjectId)
+        .eq('id', verifiedProjectId!)
         .single();
       expect(readErr).toBeNull();
 
@@ -527,7 +652,7 @@ describe.skipIf(!hasFullIntegrationCredentials)(
           status: 'open_for_booking',
           description: 'تحديث بيانات تشغيلية للمشروع المعتمد دون إعادة الاعتماد.',
         })
-        .eq('id', targetProjectId)
+        .eq('id', verifiedProjectId!)
         .select('status, description, is_official_verified, verified_by, verified_at')
         .single();
 
@@ -537,14 +662,13 @@ describe.skipIf(!hasFullIntegrationCredentials)(
       expect(updatedRow!.verified_by).toBe(beforeRow!.verified_by);
       expect(updatedRow!.verified_at).toBe(beforeRow!.verified_at);
 
-      // 6b. Even if an active admin sends a modified verified_by while keeping verified=true,
-      //     original verified_by and verified_at stay immutable.
+      // 6b. Even if active admin attempts to rewrite verified_by while verified stays true, metadata stays locked
       const { data: lockedRow, error: lockErr } = await activeAdminClient
         .from('projects')
         .update({
           verified_by: memberUser.id,
         })
-        .eq('id', targetProjectId)
+        .eq('id', verifiedProjectId!)
         .select('verified_by, verified_at')
         .single();
 
@@ -552,23 +676,21 @@ describe.skipIf(!hasFullIntegrationCredentials)(
       expect(lockedRow!.verified_by).toBe(beforeRow!.verified_by);
       expect(lockedRow!.verified_at).toBe(beforeRow!.verified_at);
 
-      // 6c. Ordinary member cannot alter project or unverify it
-      const { data: memUpdate, error: memUpdateErr } = await memberClient
-        .from('projects')
-        .update({ is_official_verified: false, description: 'تعديل غير مصرح به' })
-        .eq('id', targetProjectId)
-        .select('id');
+      // 6c. Ordinary member, anon, suspended admin, and banned admin cannot alter verified project
+      for (const unauthorizedClient of [
+        memberClient,
+        anonClient,
+        suspendedAdminClient,
+        bannedAdminClient,
+      ]) {
+        const { data: unauthData, error: unauthErr } = await unauthorizedClient
+          .from('projects')
+          .update({ is_official_verified: false, description: 'تعديل غير مصرح به' })
+          .eq('id', verifiedProjectId!)
+          .select('id');
 
-      expect(memUpdateErr !== null || (memUpdate ?? []).length === 0).toBe(true);
-
-      // 6d. Anonymous visitor cannot alter project or unverify it
-      const { data: anonUpdate, error: anonUpdateErr } = await anonClient
-        .from('projects')
-        .update({ is_official_verified: false })
-        .eq('id', targetProjectId)
-        .select('id');
-
-      expect(anonUpdateErr !== null || (anonUpdate ?? []).length === 0).toBe(true);
+        expect(unauthErr !== null || (unauthData ?? []).length === 0).toBe(true);
+      }
     });
 
     it('7. optionally inspects literal auth.uid(), auth.role(), and current_setting(role) inside SECURITY DEFINER if diagnostic probe RPC is installed', async () => {
@@ -576,7 +698,6 @@ describe.skipIf(!hasFullIntegrationCredentials)(
         'debug_postgrest_security_definer_context'
       );
 
-      // Probe RPC is temporary and optional; skip assertion cleanly if not installed
       if (probeCheck.error?.code === 'PGRST202') {
         return;
       }
