@@ -155,6 +155,11 @@ describe('ShareEK Phase 02 - Database Migrations, RLS & Security Verification', 
 
     // Explicit super_admin/admin role arrays used instead of is_active_admin in 0004 & 0005
     expect(rlsSql).not.toContain('is_active_admin');
+    expect(rlsSql).toContain('FROM pg_policies');
+    expect(fnSql).toContain('invoker_is_trusted_definer');
+    expect(fnSql).toContain("IF raw_phone LIKE '+20%'");
+    expect(fnSql).toContain("NEW.status NOT IN ('open', 'under_review')");
+    expect(fnSql).toContain('only is_read may be updated');
   });
 
   it('configures property-images (private), property-documents (private), and admin-reports (private) storage buckets', () => {
@@ -166,6 +171,8 @@ describe('ShareEK Phase 02 - Database Migrations, RLS & Security Verification', 
     expect(storageSql).toContain("'property-documents'");
     expect(storageSql).toContain("'admin-reports'");
     expect(storageSql).not.toContain('is_active_admin');
+    expect(storageSql).toContain('FROM pg_policies');
+    expect(storageSql).toContain("position('..' IN name) = 0");
     expect(storageSql).not.toMatch(/'property-images',\s*\n\s*true/i);
     expect(storageSql).toContain('property_images_select_approved_or_owner_or_admin');
     expect(storageSql).toContain('property_documents_select_owner_or_admin');

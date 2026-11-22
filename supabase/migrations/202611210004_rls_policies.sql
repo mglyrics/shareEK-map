@@ -18,6 +18,37 @@ ALTER TABLE public.admin_logs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.export_jobs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.site_settings ENABLE ROW LEVEL SECURITY;
 
+-- Pre-cleanup: remove any stale, legacy, or conflicting policies in pg_policies on all 15 public tables
+DO $$
+DECLARE
+  pol record;
+BEGIN
+  FOR pol IN
+    SELECT schemaname, tablename, policyname
+    FROM pg_policies
+    WHERE schemaname = 'public'
+      AND tablename = ANY (ARRAY[
+        'profiles',
+        'locations',
+        'properties',
+        'property_media',
+        'property_features',
+        'property_authorizations',
+        'projects',
+        'favorites',
+        'inquiries',
+        'payment_orders',
+        'reports',
+        'admin_roles',
+        'admin_logs',
+        'export_jobs',
+        'site_settings'
+      ])
+  LOOP
+    EXECUTE format('DROP POLICY IF EXISTS %I ON %I.%I;', pol.policyname, pol.schemaname, pol.tablename);
+  END LOOP;
+END $$;
+
 -- 1. profiles (Private member data: public visitors, moderators, and reports_viewers CANNOT read other profiles)
 DROP POLICY IF EXISTS "profiles_select_own_or_admin" ON public.profiles;
 CREATE POLICY "profiles_select_own_or_admin"
@@ -293,6 +324,8 @@ CREATE POLICY "property_authorizations_insert_owner"
     AND verification_status = 'pending'
     AND reviewed_by IS NULL
     AND reviewed_at IS NULL
+    AND position('..' IN storage_path) = 0
+    AND storage_path LIKE (auth.uid()::text || '/%')
     AND EXISTS (
       SELECT 1 FROM public.properties prop
       WHERE prop.id = property_id AND prop.owner_id = auth.uid()

@@ -85,7 +85,11 @@ async function setupSupabaseCompatShim(db: PGlite) {
     LANGUAGE sql
     IMMUTABLE
     AS $$
-      SELECT pg_catalog.string_to_array(name, '/');
+      SELECT CASE
+        WHEN position('/' IN name) > 0 THEN
+          (pg_catalog.string_to_array(name, '/'))[1 : pg_catalog.array_length(pg_catalog.string_to_array(name, '/'), 1) - 1]
+        ELSE ARRAY[]::text[]
+      END;
     $$;
 
     GRANT EXECUTE ON FUNCTION auth.uid() TO anon, authenticated, service_role;
@@ -285,7 +289,7 @@ describe('ShareEK Isolated Clean PostgreSQL Engine: Sequential Migrations, RLS, 
       )
     ).rejects.toThrow();
 
-    // Owner cannot self-tamper sensitive profile columns
+    // Owner CANNOT self-tamper sensitive profile columns, and changing phone resets phone_verified
     await asActor(db, { kind: 'authenticated', uid: uOwner }, (tx) =>
       tx.exec(`
         UPDATE public.profiles
@@ -303,6 +307,54 @@ describe('ShareEK Isolated Clean PostgreSQL Engine: Sequential Migrations, RLS, 
       phone_verified: false,
       is_banned: false,
     });
+
+    // Privilege escalation: NO non-super_admin (including moderator upgrading own row or admin) can escalate admin_roles
+    const { rows: modEscRows } = await asActor(db, { kind: 'authenticated', uid: uModerator }, (tx) =>
+      tx.query(`UPDATE public.admin_roles SET role = 'super_admin' WHERE user_id = '${uModerator}' RETURNING id;`)
+    );
+    expect(modEscRows).toHaveLength(0);
+    const { rows: modRoleStill } = await db.query<{ role: string }>(
+      `SELECT role::text FROM public.admin_roles WHERE user_id = '${uModerator}';`
+    );
+    expect(modRoleStill[0].role).toBe('moderator');
+
+    // handle_new_user(): optional/omitted phone succeeds cleanly (phone = NULL, phone_verified = false);
+    // +20 formatted phone normalizes cleanly; invalid phone rejects; auth.users email confirmation syncs under authenticated JWT.
+    const uOptionalPhone = '10000000-0000-4000-8000-000000000010';
+    const uIntlPhone = '10000000-0000-4000-8000-000000000011';
+    const uBadPhone = '10000000-0000-4000-8000-000000000012';
+    await db.exec(`
+      INSERT INTO auth.users (id, email, raw_user_meta_data, email_confirmed_at)
+      VALUES
+        ('${uOptionalPhone}', 'nophone@share-ek.com', '{"full_name":"مشتري بدون هاتف","member_type":"buyer"}', NULL),
+        ('${uIntlPhone}', 'intl@share-ek.com', '{"full_name":"مستخدم دولي","phone":"+20 100-555-6677","member_type":"owner"}', now());
+    `);
+    const { rows: optProfiles } = await db.query<{ id: string; phone: string | null; phone_verified: boolean; email_verified: boolean }>(
+      `SELECT id, phone, phone_verified, email_verified FROM public.profiles WHERE id IN ('${uOptionalPhone}', '${uIntlPhone}') ORDER BY id;`
+    );
+    expect(optProfiles).toEqual([
+      { id: uOptionalPhone, phone: null, phone_verified: false, email_verified: false },
+      { id: uIntlPhone, phone: '01005556677', phone_verified: false, email_verified: true },
+    ]);
+    await expect(
+      db.exec(`
+        INSERT INTO auth.users (id, email, raw_user_meta_data)
+        VALUES ('${uBadPhone}', 'badphone@share-ek.com', '{"full_name":"هاتف خاطئ","phone":"12345","member_type":"buyer"}');
+      `)
+    ).rejects.toThrow();
+
+    // Confirming email on auth.users syncs email_verified = true cleanly even if JWT context is authenticated
+    await db.transaction(async (tx) => {
+      await tx.exec(`
+        SELECT set_config('request.jwt.claim.sub', '${uOptionalPhone}', true);
+        SELECT set_config('request.jwt.claim.role', 'authenticated', true);
+        UPDATE auth.users SET email_confirmed_at = now() WHERE id = '${uOptionalPhone}';
+      `);
+    });
+    const { rows: syncedEmail } = await db.query<{ email_verified: boolean }>(
+      `SELECT email_verified FROM public.profiles WHERE id = '${uOptionalPhone}';`
+    );
+    expect(syncedEmail[0].email_verified).toBe(true);
 
     // Get seeded Cairo and New Cairo location IDs
     const { rows: locs } = await db.query<{ id: string; slug: string }>(
@@ -338,7 +390,7 @@ describe('ShareEK Isolated Clean PostgreSQL Engine: Sequential Migrations, RLS, 
       const { rows } = await asActor(db, { kind: 'authenticated', uid: privUid }, (tx) =>
         tx.query(`SELECT id FROM public.profiles;`)
       );
-      expect(rows).toHaveLength(9);
+      expect(rows).toHaveLength(11);
     }
 
     // site_settings isolation: moderator/reports_viewer/buyer/anon CANNOT read internal keys
@@ -442,8 +494,47 @@ describe('ShareEK Isolated Clean PostgreSQL Engine: Sequential Migrations, RLS, 
     );
     expect(modDirectUpd).toHaveLength(0);
 
-    // Trigger-level defense inside service_role/SECURITY DEFINER if moderator changes price via other path
-    // Moderate free pending listing via moderate_property() RPC succeeds
+    // Even when a moderator OWNS their own property, they CANNOT directly alter archived_at, published_at, expires_at, plan_type, or is_featured,
+    // nor call moderate_property() on their own listing — yet normal owner edits (title, price) still work cleanly!
+    const { rows: modOwnProp } = await asActor(db, { kind: 'authenticated', uid: uModerator }, (tx) =>
+      tx.query<{ id: string }>(
+        `INSERT INTO public.properties (
+          owner_id, slug, title, description, category, purpose, condition,
+          price_egp, area_sqm, governorate_id, status
+        ) VALUES (
+          '${uModerator}', 'mod-own-prop-1', 'عقار مملوك لمراقب محتوى',
+          'إعلان مملوك لحساب يحمل دور مراقب لاختبار عزل الصلاحيات.',
+          'residential_apartment', 'sale', 'finished', 2000000, 120, '${cairoId}', 'pending_approval'
+        ) RETURNING id;`
+      )
+    );
+    const modOwnPropId = modOwnProp[0].id;
+
+    for (const maliciousSql of [
+      `UPDATE public.properties SET archived_at = now() WHERE id = '${modOwnPropId}';`,
+      `UPDATE public.properties SET published_at = now() + interval '365 days' WHERE id = '${modOwnPropId}';`,
+      `UPDATE public.properties SET expires_at = now() + interval '3650 days' WHERE id = '${modOwnPropId}';`,
+      `UPDATE public.properties SET plan_type = 'featured', is_featured = true WHERE id = '${modOwnPropId}';`,
+      `SELECT public.moderate_property('${modOwnPropId}', 'published', 'self approve');`,
+    ]) {
+      await expect(
+        asActor(db, { kind: 'authenticated', uid: uModerator }, (tx) => tx.exec(maliciousSql))
+      ).rejects.toThrow();
+    }
+
+    // Legitimate owner edit on own property succeeds for both uOwner and moderator-as-owner
+    await asActor(db, { kind: 'authenticated', uid: uModerator }, (tx) =>
+      tx.exec(`UPDATE public.properties SET title = 'عنوان محدث بواسطة المالك' WHERE id = '${modOwnPropId}';`)
+    );
+
+    // Moderator CANNOT moderate an expired/draft status via moderate_property
+    await expect(
+      asActor(db, { kind: 'authenticated', uid: uModerator }, (tx) =>
+        tx.exec(`SELECT public.moderate_property('${pendingPropId}', 'expired', 'invalid verdict');`)
+      )
+    ).rejects.toThrow();
+
+    // Moderate another owner's free pending listing via moderate_property() RPC succeeds
     await asActor(db, { kind: 'authenticated', uid: uModerator }, (tx) =>
       tx.exec(`SELECT public.moderate_property('${pendingPropId}', 'rejected', 'بيانات ناقصة');`)
     );
@@ -451,6 +542,23 @@ describe('ShareEK Isolated Clean PostgreSQL Engine: Sequential Migrations, RLS, 
       `SELECT status::text, rejection_reason FROM public.properties WHERE id = '${pendingPropId}';`
     );
     expect(rejRow[0]).toEqual({ status: 'rejected', rejection_reason: 'بيانات ناقصة' });
+
+    // Owner cannot directly tamper archived_at, published_at, or expires_at without archive_own_property()
+    for (const illegalOwnerSql of [
+      `UPDATE public.properties SET archived_at = now() WHERE id = '${publishedPropId}';`,
+      `UPDATE public.properties SET expires_at = now() + interval '999 days' WHERE id = '${publishedPropId}';`,
+      `UPDATE public.properties SET published_at = '2020-01-01' WHERE id = '${publishedPropId}';`,
+    ]) {
+      await expect(
+        asActor(db, { kind: 'authenticated', uid: uOwner }, (tx) => tx.exec(illegalOwnerSql))
+      ).rejects.toThrow();
+    }
+
+    // Other owner/buyer CANNOT modify Owner's property, media, or features
+    const { rows: otherPropUpd } = await asActor(db, { kind: 'authenticated', uid: uBuyer }, (tx) =>
+      tx.query(`UPDATE public.properties SET title = 'استيلاء' WHERE id = '${publishedPropId}' RETURNING id;`)
+    );
+    expect(otherPropUpd).toHaveLength(0);
 
     // public_advertiser_summary exposes active publishing owner, hides buyer & unverified
     const { rows: summaryAnon } = await asActor(db, { kind: 'anon' }, (tx) =>
@@ -520,6 +628,13 @@ describe('ShareEK Isolated Clean PostgreSQL Engine: Sequential Migrations, RLS, 
     await asActor(db, { kind: 'authenticated', uid: uAdmin }, (tx) =>
       tx.exec(`SELECT public.approve_payment_order('${paidOrderId}', 'تم تأكيد التحويل');`)
     );
+
+    // Cannot approve the same payment order twice (double-approval protection)
+    await expect(
+      asActor(db, { kind: 'authenticated', uid: uSuperAdmin }, (tx) =>
+        tx.exec(`SELECT public.approve_payment_order('${paidOrderId}', 'محاولة اعتماد مزدوج');`)
+      )
+    ).rejects.toThrow();
 
     const { rows: propAfterPay } = await db.query<{ plan_type: string; is_featured: boolean; status: string }>(
       `SELECT plan_type::text, is_featured, status::text FROM public.properties WHERE id = '${publishedPropId}';`
@@ -636,9 +751,29 @@ describe('ShareEK Isolated Clean PostgreSQL Engine: Sequential Migrations, RLS, 
       expect(rows).toHaveLength(0);
     }
 
+    // Other user CANNOT insert property_authorizations for Owner's property
+    await expect(
+      asActor(db, { kind: 'authenticated', uid: uBuyer }, (tx) =>
+        tx.exec(`
+          INSERT INTO public.property_authorizations (property_id, owner_id, document_type, storage_path)
+          VALUES ('${publishedPropId}', '${uBuyer}', 'توكيل مزور', '${uBuyer}/fake.pdf');
+        `)
+      )
+    ).rejects.toThrow();
+
+    // Owner cannot alter inquiry content/sender fields; ONLY is_read can change
     await asActor(db, { kind: 'authenticated', uid: uOwner }, (tx) =>
-      tx.exec(`UPDATE public.inquiries SET is_read = true, message = 'تم التزوير', sender_phone = '01999999999' WHERE id = '${inquiryId}';`)
+      tx.exec(`UPDATE public.inquiries SET is_read = true WHERE id = '${inquiryId}';`)
     );
+    for (const illegalInqSql of [
+      `UPDATE public.inquiries SET message = 'تم التزوير' WHERE id = '${inquiryId}';`,
+      `UPDATE public.inquiries SET sender_phone = '01999999999' WHERE id = '${inquiryId}';`,
+      `UPDATE public.inquiries SET sender_name = 'معدل' WHERE id = '${inquiryId}';`,
+    ]) {
+      await expect(
+        asActor(db, { kind: 'authenticated', uid: uOwner }, (tx) => tx.exec(illegalInqSql))
+      ).rejects.toThrow();
+    }
     const { rows: inqAfter } = await db.query<{ is_read: boolean; message: string; sender_phone: string }>(
       `SELECT is_read, message, sender_phone FROM public.inquiries WHERE id = '${inquiryId}';`
     );
@@ -648,7 +783,8 @@ describe('ShareEK Isolated Clean PostgreSQL Engine: Sequential Migrations, RLS, 
       sender_phone: '01100000001',
     });
 
-    // reports: buyer inserts; direct UPDATE blocked; moderator resolves via resolve_report(); trigger locks original reason/details
+    // reports: buyer inserts; direct UPDATE blocked; reports_viewer CANNOT read individual reports;
+    // resolve_report enforces valid transitions & clears resolved_by/resolved_at when returning to under_review or open!
     const { rows: repRows } = await asActor(db, { kind: 'authenticated', uid: uBuyer }, (tx) =>
       tx.query<{ id: string }>(
         `INSERT INTO public.reports (property_id, reporter_id, reason, details)
@@ -658,13 +794,62 @@ describe('ShareEK Isolated Clean PostgreSQL Engine: Sequential Migrations, RLS, 
     );
     reportId = repRows[0].id;
 
+    const { rows: rvReports } = await asActor(db, { kind: 'authenticated', uid: uReportsViewer }, (tx) =>
+      tx.query(`SELECT id FROM public.reports;`)
+    );
+    expect(rvReports).toHaveLength(0);
+
     const { rows: repDirectUpd } = await asActor(db, { kind: 'authenticated', uid: uModerator }, (tx) =>
       tx.query(`UPDATE public.reports SET reason = 'معدل' WHERE id = '${reportId}' RETURNING id;`)
     );
     expect(repDirectUpd).toHaveLength(0);
 
     await asActor(db, { kind: 'authenticated', uid: uModerator }, (tx) =>
+      tx.exec(`SELECT public.resolve_report('${reportId}', 'under_review', 'بدء الفحص');`)
+    );
+    await asActor(db, { kind: 'authenticated', uid: uModerator }, (tx) =>
       tx.exec(`SELECT public.resolve_report('${reportId}', 'resolved', 'تم الفحص');`)
+    );
+
+    // Cannot jump directly from resolved -> dismissed or resolved -> resolved
+    await expect(
+      asActor(db, { kind: 'authenticated', uid: uModerator }, (tx) =>
+        tx.exec(`SELECT public.resolve_report('${reportId}', 'dismissed', 'قفز غير مسموح');`)
+      )
+    ).rejects.toThrow();
+    await expect(
+      asActor(db, { kind: 'authenticated', uid: uModerator }, (tx) =>
+        tx.exec(`SELECT public.resolve_report('${reportId}', 'resolved', 'تكرار');`)
+      )
+    ).rejects.toThrow();
+
+    // Returning resolved report to under_review MUST clear resolved_by and resolved_at
+    await asActor(db, { kind: 'authenticated', uid: uModerator }, (tx) =>
+      tx.exec(`SELECT public.resolve_report('${reportId}', 'under_review', 'إعادة للمراجعة');`)
+    );
+    const { rows: repUnderReview } = await db.query<{
+      status: string;
+      resolved_by: string | null;
+      resolved_at: string | null;
+    }>(`SELECT status::text, resolved_by, resolved_at::text FROM public.reports WHERE id = '${reportId}';`);
+    expect(repUnderReview[0]).toEqual({ status: 'under_review', resolved_by: null, resolved_at: null });
+
+    // Transitioning under_review -> dismissed -> open ALSO clears resolved_by and resolved_at, then resolve again
+    await asActor(db, { kind: 'authenticated', uid: uModerator }, (tx) =>
+      tx.exec(`SELECT public.resolve_report('${reportId}', 'dismissed', 'رفض مؤقت');`)
+    );
+    await asActor(db, { kind: 'authenticated', uid: uAdmin }, (tx) =>
+      tx.exec(`SELECT public.resolve_report('${reportId}', 'open', 'إعادة فتح البلاغ');`)
+    );
+    const { rows: repReopened } = await db.query<{
+      status: string;
+      resolved_by: string | null;
+      resolved_at: string | null;
+    }>(`SELECT status::text, resolved_by, resolved_at::text FROM public.reports WHERE id = '${reportId}';`);
+    expect(repReopened[0]).toEqual({ status: 'open', resolved_by: null, resolved_at: null });
+
+    await asActor(db, { kind: 'authenticated', uid: uModerator }, (tx) =>
+      tx.exec(`SELECT public.resolve_report('${reportId}', 'resolved', 'إغلاق نهائي');`)
     );
     const { rows: repAfter } = await db.query<{ status: string; resolved_by: string; reason: string }>(
       `SELECT status::text, resolved_by, reason FROM public.reports WHERE id = '${reportId}';`
@@ -908,7 +1093,7 @@ describe('ShareEK Isolated Clean PostgreSQL Engine: Sequential Migrations, RLS, 
     expect(rvDelReport).toHaveLength(0);
   });
 
-  it('7. runs supabase/tests/rls_and_lifecycle_verification.sql inside a clean fresh database transaction without errors', async () => {
+  it('7. sweeps stale/conflicting pg_policies in 0004 & 0005, prevents Signed URL access for unauthorized roles, and runs rls_and_lifecycle_verification.sql', async () => {
     const freshDb = new PGlite({ extensions: { pgcrypto, pg_trgm } });
     await freshDb.waitReady;
     await setupSupabaseCompatShim(freshDb);
@@ -916,6 +1101,42 @@ describe('ShareEK Isolated Clean PostgreSQL Engine: Sequential Migrations, RLS, 
       await freshDb.exec(fs.readFileSync(path.join(MIGRATIONS_DIR, file), 'utf8'));
     }
     await grantDefaultSupabaseTablePrivileges(freshDb);
+
+    // Inject fake stale/legacy permissive policies on public & storage.objects, then re-run 0004 & 0005
+    await freshDb.exec(`
+      CREATE POLICY "legacy_moderator_all" ON public.properties FOR ALL TO authenticated USING (true) WITH CHECK (true);
+      CREATE POLICY "public_allow_all_objects" ON storage.objects FOR SELECT TO anon USING (true);
+    `);
+    await freshDb.exec(fs.readFileSync(path.join(MIGRATIONS_DIR, '202611210004_rls_policies.sql'), 'utf8'));
+    await freshDb.exec(fs.readFileSync(path.join(MIGRATIONS_DIR, '202611210005_storage_buckets_and_policies.sql'), 'utf8'));
+
+    const { rows: stalePolicies } = await freshDb.query<{ policyname: string }>(`
+      SELECT policyname FROM pg_policies
+      WHERE policyname IN ('legacy_moderator_all', 'public_allow_all_objects')
+         OR (schemaname = 'public' AND (qual = 'true' OR with_check = 'true'))
+         OR (schemaname = 'storage' AND tablename = 'objects' AND (qual = 'true' OR with_check = 'true'));
+    `);
+    expect(stalePolicies).toHaveLength(0);
+
+    // Path traversal or bare filenames (no owner UID folder) MUST be rejected by storage.objects RLS
+    await expect(
+      asActor(db, { kind: 'authenticated', uid: uOwner }, (tx) =>
+        tx.exec(`INSERT INTO storage.objects (bucket_id, name, owner) VALUES ('property-documents', '${uOwner}/../${uBuyer}/evil.pdf', '${uOwner}');`)
+      )
+    ).rejects.toThrow();
+
+    // Signed URL authorization check: Supabase Storage issues Signed URLs ONLY when the caller passes storage.objects SELECT RLS
+    for (const actor of [
+      { kind: 'anon' as const },
+      { kind: 'authenticated' as const, uid: uBuyer },
+      { kind: 'authenticated' as const, uid: uModerator },
+      { kind: 'authenticated' as const, uid: uReportsViewer },
+    ]) {
+      const { rows: canSignDoc } = await asActor(db, actor, (tx) =>
+        tx.query(`SELECT 1 FROM storage.objects WHERE bucket_id = 'property-documents' AND name = '${uOwner}/deed-1.pdf';`)
+      );
+      expect(canSignDoc).toHaveLength(0);
+    }
 
     const verifySql = fs.readFileSync(VERIFY_SQL_PATH, 'utf8');
     await freshDb.exec(verifySql);

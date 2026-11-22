@@ -71,7 +71,7 @@ export interface Database {
           full_name: string;
           email: string;
           email_verified: boolean;
-          phone: string;
+          phone: string | null;
           phone_verified: boolean;
           member_type: DbMemberType;
           avatar_url: string | null;
@@ -86,7 +86,7 @@ export interface Database {
           full_name: string;
           email: string;
           email_verified?: boolean;
-          phone: string;
+          phone?: string | null;
           phone_verified?: boolean;
           member_type?: DbMemberType;
           avatar_url?: string | null;
@@ -98,7 +98,7 @@ export interface Database {
         };
         Update: {
           full_name?: string;
-          phone?: string;
+          phone?: string | null;
           member_type?: DbMemberType;
           avatar_url?: string | null;
           updated_at?: string;

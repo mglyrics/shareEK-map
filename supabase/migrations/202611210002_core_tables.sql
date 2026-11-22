@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS public.profiles (
   full_name text NOT NULL CHECK (char_length(trim(full_name)) >= 2),
   email text NOT NULL UNIQUE CHECK (position('@' IN email) > 1),
   email_verified boolean NOT NULL DEFAULT false,
-  phone text NOT NULL CHECK (phone ~ '^01[0125][0-9]{8}$'),
+  phone text CHECK (phone IS NULL OR phone ~ '^01[0125][0-9]{8}$'),
   phone_verified boolean NOT NULL DEFAULT false,
   member_type public.member_type_enum NOT NULL DEFAULT 'buyer',
   avatar_url text,

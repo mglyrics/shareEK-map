@@ -53,7 +53,8 @@ GRANT EXECUTE ON FUNCTION public.has_admin_role(uuid, public.admin_role_enum[])
   TO anon, authenticated, service_role;
 
 -- 2. Auth User Registration Trigger -> Profiles
--- Ensures phone_verified is ALWAYS false on signup and validates member_type safely.
+-- Ensures phone_verified is ALWAYS false on signup, validates member_type safely,
+-- and supports optional phone without breaking signups when phone is omitted.
 CREATE OR REPLACE FUNCTION public.handle_new_user()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -65,6 +66,7 @@ DECLARE
   requested_member_type text := COALESCE(raw_meta ->> 'member_type', 'buyer');
   safe_member_type public.member_type_enum;
   safe_full_name text;
+  raw_phone text;
   safe_phone text;
 BEGIN
   safe_member_type := CASE
@@ -81,9 +83,35 @@ BEGIN
     safe_full_name := 'عضو شريك';
   END IF;
 
-  safe_phone := pg_catalog.btrim(COALESCE(raw_meta ->> 'phone', ''));
-  IF safe_phone !~ '^01[0125][0-9]{8}$' THEN
-    RAISE EXCEPTION 'Invalid Egyptian mobile phone number format';
+  raw_phone := NULLIF(
+    pg_catalog.regexp_replace(
+      pg_catalog.btrim(
+        COALESCE(
+          NULLIF(pg_catalog.btrim(raw_meta ->> 'phone'), ''),
+          NULLIF(pg_catalog.btrim(pg_catalog.to_jsonb(NEW) ->> 'phone'), ''),
+          ''
+        )
+      ),
+      '[\s\-()]+',
+      '',
+      'g'
+    ),
+    ''
+  );
+
+  IF raw_phone IS NULL THEN
+    safe_phone := NULL;
+  ELSE
+    IF raw_phone LIKE '+20%' THEN
+      raw_phone := '0' || pg_catalog.substr(raw_phone, 4);
+    ELSIF raw_phone LIKE '0020%' THEN
+      raw_phone := '0' || pg_catalog.substr(raw_phone, 5);
+    END IF;
+
+    IF raw_phone !~ '^01[0125][0-9]{8}$' THEN
+      RAISE EXCEPTION 'Invalid Egyptian mobile phone number format';
+    END IF;
+    safe_phone := raw_phone;
   END IF;
 
   INSERT INTO public.profiles (
@@ -147,27 +175,42 @@ CREATE TRIGGER on_auth_user_updated
   EXECUTE FUNCTION public.handle_user_email_verified();
 
 -- 3. Protect sensitive profile columns from non-admin self-tampering
+-- Runs as SECURITY INVOKER so auth.users trigger (handle_user_email_verified) can still sync email verification
+-- while direct client updates from anon/authenticated users cannot tamper with verification or moderation flags.
 CREATE OR REPLACE FUNCTION public.protect_profile_sensitive_columns()
 RETURNS trigger
 LANGUAGE plpgsql
-SECURITY DEFINER
 SET search_path = ''
 AS $$
 DECLARE
   caller_uid uuid := auth.uid();
   jwt_role text := COALESCE(NULLIF(auth.role(), ''), '');
+  invoker_is_trusted_definer boolean := (current_user NOT IN ('anon', 'authenticated'));
+  caller_is_admin boolean := false;
 BEGIN
-  IF jwt_role IN ('anon', 'authenticated') AND (
-    caller_uid IS NULL
-    OR NOT public.has_admin_role(caller_uid, ARRAY['super_admin', 'admin']::public.admin_role_enum[])
-  ) THEN
+  IF caller_uid IS NOT NULL AND jwt_role = 'authenticated' THEN
+    caller_is_admin := public.has_admin_role(
+      caller_uid,
+      ARRAY['super_admin', 'admin']::public.admin_role_enum[]
+    );
+  END IF;
+
+  IF NOT invoker_is_trusted_definer AND NOT caller_is_admin THEN
+    NEW.id := OLD.id;
+    NEW.email := OLD.email;
     NEW.email_verified := OLD.email_verified;
     NEW.phone_verified := OLD.phone_verified;
     NEW.is_suspended := OLD.is_suspended;
     NEW.is_banned := OLD.is_banned;
     NEW.suspended_until := OLD.suspended_until;
-    NEW.email := OLD.email;
+    NEW.created_at := OLD.created_at;
   END IF;
+
+  -- Any phone change automatically resets phone_verified back to false
+  IF NEW.phone IS DISTINCT FROM OLD.phone THEN
+    NEW.phone_verified := false;
+  END IF;
+
   RETURN NEW;
 END;
 $$;
@@ -181,14 +224,16 @@ CREATE TRIGGER trg_protect_profile_sensitive_columns
   EXECUTE FUNCTION public.protect_profile_sensitive_columns();
 
 -- 4. Listing Lifecycle Enforcement Trigger
--- Note: enforce_max_property_media() is already defined and hardened in Migration 0002 (no duplicate here).
+-- Runs as SECURITY INVOKER so current_user unforgeably distinguishes direct client SQL/PostgREST DML
+-- (current_user IN ('anon', 'authenticated')) from trusted SECURITY DEFINER server RPCs (moderate_property,
+-- archive_own_property, approve_payment_order, expire_listings_batch) and service_role.
 -- - Only email-verified, non-suspended, non-banned members can publish/submit listings.
--- - Only active super_admin/admin or verified service_role can change plan_type, is_featured, price_egp on admin overrides, owner_id, or paid expiration.
--- - Moderators CANNOT change property prices, ownership, paid plans, or subscription durations.
+-- - Only active super_admin/admin or verified service_role can change plan_type, is_featured, owner_id, or paid expiration.
+-- - Moderators CANNOT directly edit archived_at, published_at, expires_at, price_egp, ownership, or content;
+--   moderation is strictly scoped to moderate_property() RPC without impairing legitimate owner edits.
 CREATE OR REPLACE FUNCTION public.enforce_property_lifecycle_rules()
 RETURNS trigger
 LANGUAGE plpgsql
-SECURITY DEFINER
 SET search_path = ''
 AS $$
 DECLARE
@@ -197,6 +242,7 @@ DECLARE
   caller_uid uuid := auth.uid();
   jwt_role text := COALESCE(NULLIF(auth.role(), ''), '');
   active_db_role text := COALESCE(NULLIF(pg_catalog.current_setting('role', true), ''), '');
+  invoker_is_trusted_definer boolean := (current_user NOT IN ('anon', 'authenticated'));
   is_service_role boolean := (
     caller_uid IS NULL
     AND jwt_role = 'service_role'
@@ -244,6 +290,8 @@ BEGIN
       NEW.plan_type := 'free';
       NEW.is_featured := false;
       NEW.archived_at := NULL;
+      NEW.rejection_reason := NULL;
+      NEW.views_count := 0;
       IF NEW.status NOT IN ('draft', 'pending_approval', 'published') THEN
         NEW.status := 'pending_approval';
       END IF;
@@ -256,37 +304,95 @@ BEGIN
       END IF;
     END IF;
   ELSIF TG_OP = 'UPDATE' THEN
-    IF caller_is_moderator AND NOT caller_is_admin THEN
-      -- Moderators can only moderate status/rejection_reason (e.g. via moderate_property RPC),
-      -- never altering price_egp, owner_id, plan_type, is_featured, or paid subscription duration.
-      IF NEW.price_egp IS DISTINCT FROM OLD.price_egp
-         OR NEW.owner_id IS DISTINCT FROM OLD.owner_id
-         OR NEW.plan_type IS DISTINCT FROM OLD.plan_type
-         OR NEW.is_featured IS DISTINCT FROM OLD.is_featured
-         OR (OLD.plan_type <> 'free' AND NEW.expires_at IS DISTINCT FROM OLD.expires_at)
-      THEN
-        RAISE EXCEPTION 'Unauthorized: Moderators cannot modify property price, ownership, paid plan, or subscription duration';
-      END IF;
-    ELSIF NOT caller_is_admin THEN
-      -- Owners cannot transfer ownership or tamper with plan, featured flag, moderation fields, or expiration
-      NEW.owner_id := OLD.owner_id;
-      NEW.plan_type := OLD.plan_type;
-      NEW.is_featured := OLD.is_featured;
-      NEW.published_at := OLD.published_at;
-      NEW.expires_at := OLD.expires_at;
-      NEW.rejection_reason := OLD.rejection_reason;
+    IF NOT caller_is_admin THEN
+      IF invoker_is_trusted_definer AND caller_is_moderator AND OLD.owner_id IS DISTINCT FROM caller_uid THEN
+        -- Trusted moderate_property() RPC executing for an active moderator on another owner's listing:
+        -- strictly forbid changing any non-moderation or financial/archival column.
+        IF NEW.id IS DISTINCT FROM OLD.id
+           OR NEW.owner_id IS DISTINCT FROM OLD.owner_id
+           OR NEW.slug IS DISTINCT FROM OLD.slug
+           OR NEW.title IS DISTINCT FROM OLD.title
+           OR NEW.description IS DISTINCT FROM OLD.description
+           OR NEW.category IS DISTINCT FROM OLD.category
+           OR NEW.purpose IS DISTINCT FROM OLD.purpose
+           OR NEW.condition IS DISTINCT FROM OLD.condition
+           OR NEW.price_egp IS DISTINCT FROM OLD.price_egp
+           OR NEW.area_sqm IS DISTINCT FROM OLD.area_sqm
+           OR NEW.governorate_id IS DISTINCT FROM OLD.governorate_id
+           OR NEW.city_id IS DISTINCT FROM OLD.city_id
+           OR NEW.district_id IS DISTINCT FROM OLD.district_id
+           OR NEW.address_details IS DISTINCT FROM OLD.address_details
+           OR NEW.bedrooms IS DISTINCT FROM OLD.bedrooms
+           OR NEW.bathrooms IS DISTINCT FROM OLD.bathrooms
+           OR NEW.floor_number IS DISTINCT FROM OLD.floor_number
+           OR NEW.plan_type IS DISTINCT FROM OLD.plan_type
+           OR NEW.is_featured IS DISTINCT FROM OLD.is_featured
+           OR NEW.archived_at IS DISTINCT FROM OLD.archived_at
+           OR NEW.views_count IS DISTINCT FROM OLD.views_count
+           OR NEW.created_at IS DISTINCT FROM OLD.created_at
+        THEN
+          RAISE EXCEPTION 'Unauthorized: Moderators cannot modify property price, ownership, paid plan, archival state, or listing content';
+        END IF;
 
-      IF OLD.archived_at IS NOT NULL AND NEW.status = 'published' THEN
-        RAISE EXCEPTION 'Archived listings cannot be republished directly by owners';
-      END IF;
+        IF OLD.archived_at IS NOT NULL THEN
+          RAISE EXCEPTION 'Unauthorized: Moderators cannot modify archived property listings';
+        END IF;
 
-      IF OLD.status IN ('suspended', 'rejected', 'expired') AND NEW.status = 'published' THEN
-        RAISE EXCEPTION 'Moderated or expired listings require administrator approval or renewal to republish';
-      END IF;
+        IF OLD.plan_type <> 'free' AND NEW.status = 'published' THEN
+          RAISE EXCEPTION 'Unauthorized: Moderators cannot publish paid or featured property listings';
+        END IF;
 
-      IF OLD.plan_type = 'free' AND NEW.status = 'published' AND OLD.status <> 'published' THEN
-        NEW.published_at := pg_catalog.now();
-        NEW.expires_at := pg_catalog.now() + pg_catalog.make_interval(days => free_days);
+        -- Only compute initial published_at/expires_at when moderating a free unarchived listing into published
+        IF NEW.status = 'published' AND OLD.plan_type = 'free' AND OLD.published_at IS NULL THEN
+          NEW.published_at := pg_catalog.now();
+          NEW.expires_at := pg_catalog.now() + pg_catalog.make_interval(days => free_days);
+        ELSE
+          IF NEW.published_at IS DISTINCT FROM OLD.published_at OR NEW.expires_at IS DISTINCT FROM OLD.expires_at THEN
+            RAISE EXCEPTION 'Unauthorized: Moderators cannot arbitrarily alter published_at or expires_at';
+          END IF;
+        END IF;
+
+      ELSIF invoker_is_trusted_definer AND caller_uid = OLD.owner_id THEN
+        -- Trusted archive_own_property() RPC executing for the listing owner
+        IF NEW.owner_id IS DISTINCT FROM OLD.owner_id
+           OR NEW.plan_type IS DISTINCT FROM OLD.plan_type
+           OR NEW.is_featured IS DISTINCT FROM OLD.is_featured
+           OR NEW.published_at IS DISTINCT FROM OLD.published_at
+           OR NEW.expires_at IS DISTINCT FROM OLD.expires_at
+           OR NEW.rejection_reason IS DISTINCT FROM OLD.rejection_reason
+           OR NEW.views_count IS DISTINCT FROM OLD.views_count
+        THEN
+          RAISE EXCEPTION 'Unauthorized: Protected property fields cannot be modified during archival';
+        END IF;
+
+      ELSE
+        -- Direct client UPDATE by owner (including a moderator updating their own listing):
+        -- strictly forbid direct alteration of lifecycle, plan, archival, moderation, or counter fields.
+        IF NEW.owner_id IS DISTINCT FROM OLD.owner_id
+           OR NEW.plan_type IS DISTINCT FROM OLD.plan_type
+           OR NEW.is_featured IS DISTINCT FROM OLD.is_featured
+           OR NEW.published_at IS DISTINCT FROM OLD.published_at
+           OR NEW.expires_at IS DISTINCT FROM OLD.expires_at
+           OR NEW.archived_at IS DISTINCT FROM OLD.archived_at
+           OR NEW.rejection_reason IS DISTINCT FROM OLD.rejection_reason
+           OR NEW.views_count IS DISTINCT FROM OLD.views_count
+           OR NEW.created_at IS DISTINCT FROM OLD.created_at
+        THEN
+          RAISE EXCEPTION 'Unauthorized: Protected property lifecycle fields (archived_at, published_at, expires_at, plan_type, owner_id) cannot be modified directly';
+        END IF;
+
+        IF OLD.archived_at IS NOT NULL AND NEW.status = 'published' THEN
+          RAISE EXCEPTION 'Archived listings cannot be republished directly by owners';
+        END IF;
+
+        IF OLD.status IN ('suspended', 'rejected', 'expired') AND NEW.status = 'published' THEN
+          RAISE EXCEPTION 'Moderated or expired listings require administrator approval or renewal to republish';
+        END IF;
+
+        IF OLD.plan_type = 'free' AND NEW.status = 'published' AND OLD.status <> 'published' THEN
+          NEW.published_at := pg_catalog.now();
+          NEW.expires_at := pg_catalog.now() + pg_catalog.make_interval(days => free_days);
+        END IF;
       END IF;
     END IF;
   END IF;
@@ -476,20 +582,25 @@ CREATE TRIGGER trg_protect_property_authorizations_integrity
   FOR EACH ROW
   EXECUTE FUNCTION public.protect_property_authorizations_integrity();
 
--- 5c. inquiries: Prevent alteration of original sender/message content; only is_read may change
+-- 5c. inquiries: Strictly prevent alteration of any column other than is_read (and automatic updated_at)
 CREATE OR REPLACE FUNCTION public.protect_inquiries_immutability()
 RETURNS trigger
 LANGUAGE plpgsql
 SET search_path = ''
 AS $$
 BEGIN
-  NEW.property_id := OLD.property_id;
-  NEW.sender_id := OLD.sender_id;
-  NEW.sender_name := OLD.sender_name;
-  NEW.sender_phone := OLD.sender_phone;
-  NEW.sender_email := OLD.sender_email;
-  NEW.message := OLD.message;
-  NEW.created_at := OLD.created_at;
+  IF NEW.id IS DISTINCT FROM OLD.id
+     OR NEW.property_id IS DISTINCT FROM OLD.property_id
+     OR NEW.sender_id IS DISTINCT FROM OLD.sender_id
+     OR NEW.sender_name IS DISTINCT FROM OLD.sender_name
+     OR NEW.sender_phone IS DISTINCT FROM OLD.sender_phone
+     OR NEW.sender_email IS DISTINCT FROM OLD.sender_email
+     OR NEW.message IS DISTINCT FROM OLD.message
+     OR NEW.created_at IS DISTINCT FROM OLD.created_at
+  THEN
+    RAISE EXCEPTION 'Unauthorized: Inquiries are immutable after submission; only is_read may be updated';
+  END IF;
+
   RETURN NEW;
 END;
 $$;
@@ -502,7 +613,9 @@ CREATE TRIGGER trg_protect_inquiries_immutability
   FOR EACH ROW
   EXECUTE FUNCTION public.protect_inquiries_immutability();
 
--- 5d. reports: Lock original report submission details and bind resolved_by to authorized moderator/admin
+-- 5d. reports: Lock original report submission details, enforce state machine transitions
+--     across (open, under_review, resolved, dismissed), and clear resolved_by/resolved_at
+--     whenever a report is reopened ('open') or returned to review ('under_review').
 CREATE OR REPLACE FUNCTION public.protect_reports_immutability()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -520,6 +633,18 @@ DECLARE
   );
   caller_can_moderate boolean := false;
 BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF NOT is_service_role AND (
+      NEW.status <> 'open'
+      OR NEW.resolved_by IS NOT NULL
+      OR NEW.resolved_at IS NOT NULL
+      OR NEW.resolution_notes IS NOT NULL
+    ) THEN
+      RAISE EXCEPTION 'New reports must start with open status and null resolution metadata';
+    END IF;
+    RETURN NEW;
+  END IF;
+
   IF caller_uid IS NOT NULL AND jwt_role = 'authenticated' THEN
     caller_can_moderate := public.has_admin_role(
       caller_uid,
@@ -528,11 +653,15 @@ BEGIN
   END IF;
 
   -- Original report details are strictly immutable after creation
-  NEW.property_id := OLD.property_id;
-  NEW.reporter_id := OLD.reporter_id;
-  NEW.reason := OLD.reason;
-  NEW.details := OLD.details;
-  NEW.created_at := OLD.created_at;
+  IF NEW.id IS DISTINCT FROM OLD.id
+     OR NEW.property_id IS DISTINCT FROM OLD.property_id
+     OR NEW.reporter_id IS DISTINCT FROM OLD.reporter_id
+     OR NEW.reason IS DISTINCT FROM OLD.reason
+     OR NEW.details IS DISTINCT FROM OLD.details
+     OR NEW.created_at IS DISTINCT FROM OLD.created_at
+  THEN
+    RAISE EXCEPTION 'Original report details (property, reporter, reason, details) are immutable after submission';
+  END IF;
 
   IF NEW.status IS DISTINCT FROM OLD.status
      OR NEW.resolved_by IS DISTINCT FROM OLD.resolved_by
@@ -540,25 +669,46 @@ BEGIN
      OR NEW.resolution_notes IS DISTINCT FROM OLD.resolution_notes
   THEN
     IF NOT caller_can_moderate AND NOT is_service_role THEN
-      RAISE EXCEPTION 'Unauthorized: Only active moderators or administrators may resolve reports';
+      RAISE EXCEPTION 'Unauthorized: Only active moderators or administrators may update report status';
     END IF;
 
-    IF NEW.status IN ('resolved', 'dismissed') THEN
-      IF caller_can_moderate AND NOT is_service_role THEN
-        NEW.resolved_by := caller_uid;
-        NEW.resolved_at := pg_catalog.now();
-      ELSIF is_service_role THEN
-        IF NEW.resolved_by IS NULL OR NOT public.has_admin_role(
-          NEW.resolved_by,
-          ARRAY['super_admin', 'admin', 'moderator']::public.admin_role_enum[]
-        ) THEN
-          RAISE EXCEPTION 'resolved_by must reference an active moderator or administrator';
-        END IF;
-        NEW.resolved_at := COALESCE(NEW.resolved_at, pg_catalog.now());
+    IF NEW.status IS DISTINCT FROM OLD.status THEN
+      -- Enforce state transition rules across (open, under_review, resolved, dismissed)
+      IF OLD.status = 'open' AND NEW.status NOT IN ('under_review', 'resolved', 'dismissed') THEN
+        RAISE EXCEPTION 'Invalid report status transition from % to %', OLD.status, NEW.status;
+      ELSIF OLD.status = 'under_review' AND NEW.status NOT IN ('open', 'resolved', 'dismissed') THEN
+        RAISE EXCEPTION 'Invalid report status transition from % to %', OLD.status, NEW.status;
+      ELSIF OLD.status IN ('resolved', 'dismissed') AND NEW.status NOT IN ('open', 'under_review') THEN
+        RAISE EXCEPTION 'Invalid report status transition from % to %: reopen or return to under_review first', OLD.status, NEW.status;
       END IF;
-    ELSIF NEW.status = 'open' THEN
-      NEW.resolved_by := NULL;
-      NEW.resolved_at := NULL;
+
+      IF NEW.status IN ('resolved', 'dismissed') THEN
+        IF caller_can_moderate AND NOT is_service_role THEN
+          NEW.resolved_by := caller_uid;
+          NEW.resolved_at := pg_catalog.now();
+        ELSIF is_service_role THEN
+          IF NEW.resolved_by IS NULL OR NOT public.has_admin_role(
+            NEW.resolved_by,
+            ARRAY['super_admin', 'admin', 'moderator']::public.admin_role_enum[]
+          ) THEN
+            RAISE EXCEPTION 'resolved_by must reference an active moderator or administrator';
+          END IF;
+          NEW.resolved_at := pg_catalog.now();
+        END IF;
+      ELSE
+        -- Reopening ('open') or returning to review ('under_review') ALWAYS clears prior resolution metadata
+        NEW.resolved_by := NULL;
+        NEW.resolved_at := NULL;
+      END IF;
+    ELSE
+      -- Status did not change: enforce resolution metadata consistency
+      IF OLD.status IN ('open', 'under_review') THEN
+        NEW.resolved_by := NULL;
+        NEW.resolved_at := NULL;
+      ELSE
+        NEW.resolved_by := OLD.resolved_by;
+        NEW.resolved_at := OLD.resolved_at;
+      END IF;
     END IF;
   END IF;
 
@@ -570,7 +720,7 @@ REVOKE ALL ON FUNCTION public.protect_reports_immutability() FROM PUBLIC, anon, 
 
 DROP TRIGGER IF EXISTS trg_protect_reports_immutability ON public.reports;
 CREATE TRIGGER trg_protect_reports_immutability
-  BEFORE UPDATE ON public.reports
+  BEFORE INSERT OR UPDATE ON public.reports
   FOR EACH ROW
   EXECUTE FUNCTION public.protect_reports_immutability();
 
@@ -657,6 +807,13 @@ BEGIN
 
   computed_amount := pg_catalog.round(GREATEST(computed_amount, 1.00), 2);
 
+  IF receipt_storage_path_input IS NOT NULL AND pg_catalog.btrim(receipt_storage_path_input) <> '' THEN
+    IF position('..' IN receipt_storage_path_input) > 0
+       OR pg_catalog.left(pg_catalog.btrim(receipt_storage_path_input), 37) <> (caller_id::text || '/') THEN
+      RAISE EXCEPTION 'Invalid receipt storage path prefix';
+    END IF;
+  END IF;
+
   generated_ref := 'SHK-' || pg_catalog.upper(pg_catalog.substr(pg_catalog.replace(pg_catalog.gen_random_uuid()::text, '-', ''), 1, 10));
 
   INSERT INTO public.payment_orders (
@@ -713,6 +870,13 @@ BEGIN
 
   IF clean_transfer_ref IS NULL AND clean_receipt_path IS NULL THEN
     RAISE EXCEPTION 'Transfer reference or receipt storage path is required';
+  END IF;
+
+  IF clean_receipt_path IS NOT NULL THEN
+    IF position('..' IN clean_receipt_path) > 0
+       OR pg_catalog.left(clean_receipt_path, 37) <> (caller_id::text || '/') THEN
+      RAISE EXCEPTION 'Invalid receipt storage path prefix';
+    END IF;
   END IF;
 
   SELECT * INTO target_order
@@ -1005,8 +1169,16 @@ BEGIN
     RAISE EXCEPTION 'Property not found';
   END IF;
 
-  IF target_prop.archived_at IS NOT NULL AND new_status = 'published' THEN
-    RAISE EXCEPTION 'Cannot publish an archived property listing';
+  IF caller_role = 'moderator' AND target_prop.owner_id = caller_id THEN
+    RAISE EXCEPTION 'Unauthorized: Moderators cannot moderate their own property listings';
+  END IF;
+
+  IF caller_role = 'moderator' AND new_status NOT IN ('pending_approval', 'published', 'rejected', 'suspended') THEN
+    RAISE EXCEPTION 'Unauthorized: Moderators may only set status to pending_approval, published, rejected, or suspended';
+  END IF;
+
+  IF target_prop.archived_at IS NOT NULL AND (caller_role = 'moderator' OR new_status = 'published') THEN
+    RAISE EXCEPTION 'Cannot moderate or publish an archived property listing';
   END IF;
 
   -- Moderators can only approve free listings or reject/suspend violating listings;
@@ -1196,7 +1368,7 @@ BEGIN
     RAISE EXCEPTION 'Unauthorized: Moderator or Administrator role required';
   END IF;
 
-  IF new_status NOT IN ('under_review', 'resolved', 'dismissed') THEN
+  IF new_status NOT IN ('open', 'under_review', 'resolved', 'dismissed') THEN
     RAISE EXCEPTION 'Invalid target report status: %', new_status;
   END IF;
 
@@ -1220,6 +1392,18 @@ BEGIN
 
   IF NOT FOUND THEN
     RAISE EXCEPTION 'Report not found';
+  END IF;
+
+  IF target_report.status = new_status THEN
+    RAISE EXCEPTION 'Report is already in status %', new_status;
+  END IF;
+
+  IF target_report.status = 'open' AND new_status NOT IN ('under_review', 'resolved', 'dismissed') THEN
+    RAISE EXCEPTION 'Invalid report transition from % to %', target_report.status, new_status;
+  ELSIF target_report.status = 'under_review' AND new_status NOT IN ('open', 'resolved', 'dismissed') THEN
+    RAISE EXCEPTION 'Invalid report transition from % to %', target_report.status, new_status;
+  ELSIF target_report.status IN ('resolved', 'dismissed') AND new_status NOT IN ('open', 'under_review') THEN
+    RAISE EXCEPTION 'Invalid report transition from % to %: reopen or return to under_review first', target_report.status, new_status;
   END IF;
 
   UPDATE public.reports

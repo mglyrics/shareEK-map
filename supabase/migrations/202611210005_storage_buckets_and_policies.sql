@@ -36,7 +36,31 @@ ON CONFLICT (id) DO UPDATE SET
   file_size_limit = EXCLUDED.file_size_limit,
   allowed_mime_types = EXCLUDED.allowed_mime_types;
 
--- 2. Storage Policies for 'property-images' (Private; Signed URLs gated by RLS)
+-- 2. Storage Pre-cleanup: remove any legacy, blanket, or conflicting policies in pg_policies on storage.objects
+DO $$
+DECLARE
+  pol record;
+BEGIN
+  FOR pol IN
+    SELECT policyname
+    FROM pg_policies
+    WHERE schemaname = 'storage'
+      AND tablename = 'objects'
+      AND (
+        COALESCE(qual, '') ~* '(property-images|property-documents|admin-reports)'
+        OR COALESCE(with_check, '') ~* '(property-images|property-documents|admin-reports)'
+        OR (COALESCE(qual, '') <> '' AND COALESCE(qual, '') !~* 'bucket_id')
+        OR (COALESCE(with_check, '') <> '' AND COALESCE(with_check, '') !~* 'bucket_id')
+        OR COALESCE(qual, '') ~* '^\s*\(?\s*true\s*\)?\s*$'
+        OR COALESCE(with_check, '') ~* '^\s*\(?\s*true\s*\)?\s*$'
+        OR policyname ~* '^(property_images|property_documents|admin_reports|public|allow|give_users)'
+      )
+  LOOP
+    EXECUTE format('DROP POLICY IF EXISTS %I ON storage.objects;', pol.policyname);
+  END LOOP;
+END $$;
+
+-- 3. Storage Policies for 'property-images' (Private; Signed URLs gated by RLS)
 -- Public visitors (anon/authenticated) can sign/read images ONLY when linked to a published, non-archived, non-expired listing.
 DROP POLICY IF EXISTS "property_images_select_approved_or_owner_or_admin" ON storage.objects;
 CREATE POLICY "property_images_select_approved_or_owner_or_admin"
@@ -72,6 +96,8 @@ CREATE POLICY "property_images_insert_verified_owner"
   TO authenticated
   WITH CHECK (
     bucket_id = 'property-images'
+    AND position('..' IN name) = 0
+    AND position('/' IN name) > 1
     AND (storage.foldername(name))[1] = auth.uid()::text
     AND EXISTS (
       SELECT 1 FROM public.profiles p
@@ -89,14 +115,22 @@ CREATE POLICY "property_images_update_owner_or_admin"
   USING (
     bucket_id = 'property-images'
     AND (
-      (storage.foldername(name))[1] = auth.uid()::text
+      (
+        position('..' IN name) = 0
+        AND position('/' IN name) > 1
+        AND (storage.foldername(name))[1] = auth.uid()::text
+      )
       OR public.has_admin_role(auth.uid(), ARRAY['super_admin', 'admin']::public.admin_role_enum[])
     )
   )
   WITH CHECK (
     bucket_id = 'property-images'
     AND (
-      (storage.foldername(name))[1] = auth.uid()::text
+      (
+        position('..' IN name) = 0
+        AND position('/' IN name) > 1
+        AND (storage.foldername(name))[1] = auth.uid()::text
+      )
       OR public.has_admin_role(auth.uid(), ARRAY['super_admin', 'admin']::public.admin_role_enum[])
     )
   );
@@ -134,6 +168,8 @@ CREATE POLICY "property_documents_insert_owner"
   TO authenticated
   WITH CHECK (
     bucket_id = 'property-documents'
+    AND position('..' IN name) = 0
+    AND position('/' IN name) > 1
     AND (storage.foldername(name))[1] = auth.uid()::text
     AND EXISTS (
       SELECT 1 FROM public.profiles p

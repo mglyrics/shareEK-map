@@ -714,25 +714,40 @@ describe.skipIf(!hasIsolatedIntegrationEnv)(
       expect(modIsAdmin.data).toBe(false);
       expect(rvIsAdmin.data).toBe(false);
 
-      // 7b. moderator cannot directly update properties price/owner/plan
+      // 7b. moderator cannot directly update properties price/owner/plan/archived_at/published_at/expires_at
       const { data: modPropUpd, error: modPropErr } = await moderatorClient
         .from('properties')
-        .update({ price_egp: 1, plan_type: 'featured' })
+        .update({
+          price_egp: 1,
+          plan_type: 'featured',
+          archived_at: new Date().toISOString(),
+          expires_at: '2099-01-01T00:00:00.000Z',
+        })
         .eq('id', publishedPropertyId)
         .select('id');
       expect(modPropErr !== null || (modPropUpd ?? []).length === 0).toBe(true);
 
-      // 7c. reports_viewer cannot view other profiles, payment_orders, admin_logs, or inquiries
+      // 7c. Ordinary users & admins cannot escalate privileges in admin_roles
+      for (const client of [memberClient, ownerClient, moderatorClient, reportsViewerClient, activeAdminClient]) {
+        const { error: escErr } = await client
+          .from('admin_roles')
+          .insert({ user_id: memberUser.id, role: 'super_admin' });
+        expect(escErr).not.toBeNull();
+      }
+
+      // 7d. reports_viewer cannot view other profiles, payment_orders, individual reports, admin_logs, or inquiries
       const { data: rvProfiles } = await reportsViewerClient
         .from('profiles')
         .select('id')
         .neq('id', reportsViewerUser.id);
       const { data: rvPayments } = await reportsViewerClient.from('payment_orders').select('id');
+      const { data: rvReports } = await reportsViewerClient.from('reports').select('id');
       const { data: rvLogs } = await reportsViewerClient.from('admin_logs').select('id');
       const { data: rvInquiries } = await reportsViewerClient.from('inquiries').select('id');
 
       expect(rvProfiles ?? []).toHaveLength(0);
       expect(rvPayments ?? []).toHaveLength(0);
+      expect(rvReports ?? []).toHaveLength(0);
       expect(rvLogs ?? []).toHaveLength(0);
       expect(rvInquiries ?? []).toHaveLength(0);
 
@@ -741,7 +756,7 @@ describe.skipIf(!hasIsolatedIntegrationEnv)(
       expect(statsRes.error).toBeNull();
       expect(statsRes.data).toHaveProperty('published_properties');
 
-      // 7d. Direct client INSERT into payment_orders and admin_logs is blocked by RLS
+      // 7e. Direct client INSERT into payment_orders and admin_logs is blocked by RLS
       const { error: payInsErr } = await ownerClient.from('payment_orders').insert({
         property_id: publishedPropertyId,
         user_id: ownerUser.id,
@@ -760,7 +775,7 @@ describe.skipIf(!hasIsolatedIntegrationEnv)(
       });
       expect(logInsErr).not.toBeNull();
 
-      // 7e. public_advertiser_summary exposes publishing owner but hides non-publishing buyer
+      // 7f. public_advertiser_summary exposes publishing owner but hides non-publishing buyer
       const { data: summaryOwner } = await anonClient
         .from('public_advertiser_summary')
         .select('id')
@@ -773,11 +788,13 @@ describe.skipIf(!hasIsolatedIntegrationEnv)(
       expect((summaryOwner ?? []).length).toBe(1);
       expect((summaryBuyer ?? []).length).toBe(0);
 
-      // 7f. Private property-documents bucket rejects signed URL / list from unauthorized roles
-      const { data: unauthSignedUrl, error: signedUrlErr } = await moderatorClient.storage
-        .from('property-documents')
-        .createSignedUrl(`${ownerUser.id}/sample.pdf`, 60);
-      expect(signedUrlErr !== null || !unauthSignedUrl?.signedUrl).toBe(true);
+      // 7g. Private property-documents bucket rejects signed URL / list from unauthorized roles
+      for (const unauthClient of [anonClient, memberClient, moderatorClient, reportsViewerClient]) {
+        const { data: unauthSignedUrl, error: signedUrlErr } = await unauthClient.storage
+          .from('property-documents')
+          .createSignedUrl(`${ownerUser.id}/sample.pdf`, 60);
+        expect(signedUrlErr !== null || !unauthSignedUrl?.signedUrl).toBe(true);
+      }
     });
 
     it('8. optionally inspects literal auth.uid(), auth.role(), and current_setting(role) inside SECURITY DEFINER if diagnostic probe RPC is installed', async () => {

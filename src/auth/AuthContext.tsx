@@ -109,7 +109,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         fullName: data.full_name,
         email: data.email,
         emailVerified: data.email_verified,
-        phone: data.phone,
+        phone: data.phone ?? '',
         phoneVerified: data.phone_verified,
         memberType: mapDbMemberTypeToDomain(data.member_type),
         avatarUrl: data.avatar_url ?? undefined,
@@ -153,8 +153,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       return { error: supabaseStatusMessage };
     }
 
-    const trimmedPhone = payload.phone.trim();
-    if (!/^01[0125][0-9]{8}$/.test(trimmedPhone)) {
+    const normalizedPhone = payload.phone
+      .trim()
+      .replace(/[\s\-()]+/g, '')
+      .replace(/^(?:\+20|0020)/, '0');
+    if (normalizedPhone && !/^01[0125][0-9]{8}$/.test(normalizedPhone)) {
       return { error: 'يرجى إدخال رقم هاتف محمول مصري صحيح مكون من 11 رقماً (يبدأ بـ 010 أو 011 أو 012 أو 015).' };
     }
 
@@ -165,7 +168,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         emailRedirectTo: `${window.location.origin}/verify-email`,
         data: {
           full_name: payload.fullName.trim(),
-          phone: trimmedPhone,
+          ...(normalizedPhone ? { phone: normalizedPhone } : {}),
           member_type: payload.memberType,
         },
       },

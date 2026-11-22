@@ -226,24 +226,30 @@ BEGIN
     RAISE EXCEPTION 'Unauthorized user was able to update another user property';
   END IF;
 
-  -- Owner marks inquiry read, but original message MUST remain immutable
+  -- Owner marks inquiry read (succeeds), while altering message/sender content MUST raise exception
   RESET ROLE;
   PERFORM set_config('request.jwt.claim.sub', u_owner::text, true);
   PERFORM set_config('request.jwt.claim.role', 'authenticated', true);
   SET LOCAL ROLE authenticated;
 
-  UPDATE public.inquiries SET is_read = true, message = 'رسالة مزورة' WHERE id = inquiry_id;
+  UPDATE public.inquiries SET is_read = true WHERE id = inquiry_id;
+  BEGIN
+    UPDATE public.inquiries SET message = 'رسالة مزورة' WHERE id = inquiry_id;
+    RAISE EXCEPTION 'Expected inquiries content alteration to raise exception';
+  EXCEPTION WHEN OTHERS THEN
+    NULL;
+  END;
   IF EXISTS (SELECT 1 FROM public.inquiries WHERE id = inquiry_id AND message = 'رسالة مزورة') THEN
     RAISE EXCEPTION 'inquiries original message was modified!';
   END IF;
 
-  -- Moderator isolation checks: CANNOT change property price, CANNOT approve payment, CANNOT review authorization
+  -- Moderator isolation checks: CANNOT change property price/archived_at, CANNOT approve payment, CANNOT review authorization
   RESET ROLE;
   PERFORM set_config('request.jwt.claim.sub', u_moderator::text, true);
   PERFORM set_config('request.jwt.claim.role', 'authenticated', true);
   SET LOCAL ROLE authenticated;
 
-  UPDATE public.properties SET price_egp = 1.00 WHERE id = prop_id;
+  UPDATE public.properties SET price_egp = 1.00, archived_at = now() WHERE id = prop_id;
   GET DIAGNOSTICS other_update_count = ROW_COUNT;
   IF other_update_count <> 0 THEN
     RAISE EXCEPTION 'Moderator must not be able to directly update properties';
@@ -263,10 +269,18 @@ BEGIN
     NULL;
   END;
 
-  -- Moderator CAN resolve report via trusted RPC
+  -- Moderator CAN transition report via resolve_report() and reopening/returning to review clears resolved_by/resolved_at
   PERFORM public.resolve_report(report_id, 'resolved', 'تم التحقق');
+  PERFORM public.resolve_report(report_id, 'under_review', 'إعادة فحص');
+  IF EXISTS (
+    SELECT 1 FROM public.reports
+    WHERE id = report_id AND (resolved_by IS NOT NULL OR resolved_at IS NOT NULL)
+  ) THEN
+    RAISE EXCEPTION 'Expected resolved_by and resolved_at to be cleared when returning report to under_review';
+  END IF;
+  PERFORM public.resolve_report(report_id, 'resolved', 'تم الإغلاق النهائي');
 
-  -- reports_viewer isolation checks: CANNOT read payment_orders or other users' profiles or admin_logs
+  -- reports_viewer isolation checks: CANNOT read individual reports, payment_orders, other users' profiles, or admin_logs
   RESET ROLE;
   PERFORM set_config('request.jwt.claim.sub', u_reports_viewer::text, true);
   PERFORM set_config('request.jwt.claim.role', 'authenticated', true);
@@ -277,11 +291,14 @@ BEGIN
   IF rv_payment_count <> 0 OR rv_profiles_count <> 0 THEN
     RAISE EXCEPTION 'reports_viewer must not see payment_orders or other member profiles';
   END IF;
+  IF EXISTS (SELECT 1 FROM public.reports) THEN
+    RAISE EXCEPTION 'reports_viewer must not see individual reports';
+  END IF;
 
   -- reports_viewer CAN read aggregate non-PII stats
   PERFORM public.get_reports_summary_stats();
 
-  -- Active admin approves payment order, reviews authorization, cannot direct-insert admin_logs, and verifies project
+  -- Active admin approves payment order (once only!), reviews authorization, cannot direct-insert admin_logs, and verifies project
   RESET ROLE;
   PERFORM set_config('request.jwt.claim.sub', u_admin::text, true);
   PERFORM set_config('request.jwt.claim.role', 'authenticated', true);
@@ -296,6 +313,12 @@ BEGIN
   END;
 
   PERFORM public.approve_payment_order(order_id, 'Verified via InstaPay');
+  BEGIN
+    PERFORM public.approve_payment_order(order_id, 'Double approval attempt');
+    RAISE EXCEPTION 'Expected double payment approval to fail';
+  EXCEPTION WHEN OTHERS THEN
+    NULL;
+  END;
   PERFORM public.review_property_authorization(auth_id, 'verified', 'Document verified');
 
   INSERT INTO public.projects (
