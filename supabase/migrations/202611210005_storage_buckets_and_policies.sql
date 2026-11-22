@@ -56,7 +56,11 @@ BEGIN
         OR policyname ~* '^(property_images|property_documents|admin_reports|public|allow|give_users)'
       )
   LOOP
-    EXECUTE format('DROP POLICY IF EXISTS %I ON storage.objects;', pol.policyname);
+    BEGIN
+      EXECUTE format('DROP POLICY IF EXISTS %I ON storage.objects;', pol.policyname);
+    EXCEPTION WHEN insufficient_privilege THEN
+      RAISE NOTICE 'Skipped dropping policy % on storage.objects due to ownership', pol.policyname;
+    END;
   END LOOP;
 END $$;
 

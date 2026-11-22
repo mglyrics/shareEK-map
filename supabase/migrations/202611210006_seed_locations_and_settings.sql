@@ -136,3 +136,6 @@ VALUES
     'Manual payment verification channels (InstaPay & WhatsApp)'
   )
 ON CONFLICT (key) DO NOTHING;
+
+-- Refresh PostgREST schema cache immediately after applying migrations
+NOTIFY pgrst, 'reload schema';

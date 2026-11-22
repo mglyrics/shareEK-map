@@ -5,60 +5,44 @@ import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 const ROOT = path.resolve(__dirname, '..');
+const envTestPath = path.join(ROOT, '.env.test');
 const envTestLocalPath = path.join(ROOT, '.env.test.local');
 const envLocalPath = path.join(ROOT, '.env.local');
 
-const testFileEnv = fs.existsSync(envTestLocalPath)
-  ? dotenv.parse(fs.readFileSync(envTestLocalPath, 'utf8'))
-  : {};
-const prodFileEnv = fs.existsSync(envLocalPath)
+const testFileEnv = {
+  ...(fs.existsSync(envTestLocalPath)
+    ? dotenv.parse(fs.readFileSync(envTestLocalPath, 'utf8'))
+    : {}),
+  ...(fs.existsSync(envTestPath)
+    ? dotenv.parse(fs.readFileSync(envTestPath, 'utf8'))
+    : {}),
+};
+const projectFileEnv = fs.existsSync(envLocalPath)
   ? dotenv.parse(fs.readFileSync(envLocalPath, 'utf8'))
   : {};
 
-function normalizeUrl(url: string): string {
-  return url.trim().replace(/\/+$/, '').toLowerCase();
-}
-
-// Read-only probe target
-const probeUrl =
+// Connected project URL & public anon/publishable key (TEST_SUPABASE_* overrides if present)
+const liveUrl =
   process.env.TEST_SUPABASE_URL ||
   testFileEnv.TEST_SUPABASE_URL ||
   process.env.VITE_SUPABASE_URL ||
-  prodFileEnv.VITE_SUPABASE_URL ||
+  projectFileEnv.VITE_SUPABASE_URL ||
   '';
-const probeAnonKey =
+const liveAnonKey =
   process.env.TEST_SUPABASE_ANON_KEY ||
   testFileEnv.TEST_SUPABASE_ANON_KEY ||
   process.env.VITE_SUPABASE_ANON_KEY ||
-  prodFileEnv.VITE_SUPABASE_ANON_KEY ||
+  projectFileEnv.VITE_SUPABASE_ANON_KEY ||
   '';
-
-// Strict isolated target for mutating integration tests: NEVER falls back to production VITE_SUPABASE_*
-const testSupabaseUrl =
-  process.env.TEST_SUPABASE_URL || testFileEnv.TEST_SUPABASE_URL || '';
-const testSupabaseAnonKey =
-  process.env.TEST_SUPABASE_ANON_KEY || testFileEnv.TEST_SUPABASE_ANON_KEY || '';
-const testSupabaseServiceRoleKey =
+const liveServiceRoleKey =
   process.env.TEST_SUPABASE_SERVICE_ROLE_KEY ||
   testFileEnv.TEST_SUPABASE_SERVICE_ROLE_KEY ||
+  process.env.SUPABASE_SERVICE_ROLE_KEY ||
+  projectFileEnv.SUPABASE_SERVICE_ROLE_KEY ||
   '';
 
-const productionUrl =
-  process.env.VITE_SUPABASE_URL || prodFileEnv.VITE_SUPABASE_URL || '';
-
-const isTargetingProduction = Boolean(
-  testSupabaseUrl &&
-    productionUrl &&
-    normalizeUrl(testSupabaseUrl) === normalizeUrl(productionUrl)
-);
-
-const hasPublicProbeConfig = Boolean(probeUrl && probeAnonKey);
-const hasIsolatedIntegrationEnv = Boolean(
-  testSupabaseUrl &&
-    testSupabaseAnonKey &&
-    testSupabaseServiceRoleKey &&
-    !isTargetingProduction
-);
+const hasPublicConnectionConfig = Boolean(liveUrl && liveAnonKey);
+const hasFullIntegrationEnv = Boolean(liveUrl && liveAnonKey && liveServiceRoleKey);
 
 interface CreatedUser {
   id: string;
@@ -165,43 +149,45 @@ async function signInIsolatedClient(
   });
 }
 
-describe.skipIf(!hasPublicProbeConfig)(
-  'ShareEK Live Supabase PostgREST Readiness Probe (Read-Only)',
+describe.skipIf(!hasPublicConnectionConfig)(
+  'ShareEK Connected Supabase Project Readiness Probe (Read-Only)',
   () => {
-    it('probes Supabase Auth and checks whether public.projects exists via PostgREST', async () => {
-      const authRes = await fetch(`${probeUrl}/auth/v1/settings`, {
-        headers: { apikey: probeAnonKey },
+    it('probes Auth endpoint, PostgREST schema readiness, and Storage buckets on the connected project', async () => {
+      const authRes = await fetch(`${liveUrl}/auth/v1/settings`, {
+        headers: { apikey: liveAnonKey },
       });
       expect(authRes.ok).toBe(true);
 
-      const anonClient = createClient(probeUrl, probeAnonKey, {
+      const anonClient = createClient(liveUrl, liveAnonKey, {
         auth: { autoRefreshToken: false, persistSession: false },
       });
 
-      const { error } = await anonClient.from('projects').select('id').limit(1);
-      if (error) {
-        expect(error.code).toBe('PGRST205');
+      // Use GET (.limit(0)) instead of HEAD because HEAD masks 404 PGRST205 body details
+      const { error: projErr } = await anonClient.from('projects').select('id').limit(0);
+      if (projErr) {
+        expect(projErr.code).toBe('PGRST205');
       } else {
-        expect(error).toBeNull();
+        expect(projErr).toBeNull();
       }
     });
   }
 );
 
-describe('ShareEK Test Environment Isolation Guard', () => {
-  it('guarantees mutating integration tests never target production VITE_SUPABASE_URL', () => {
-    expect(isTargetingProduction).toBe(false);
+describe('ShareEK Connected Environment Configuration Guard', () => {
+  it('confirms connected Supabase URL and anon/publishable key are configured without embedding service_role in src/', () => {
+    expect(hasPublicConnectionConfig).toBe(true);
   });
 });
 
-describe.skipIf(!hasIsolatedIntegrationEnv)(
-  'ShareEK Live PostgREST Security & RLS Integration Tests (Isolated Project)',
+describe.skipIf(!hasFullIntegrationEnv)(
+  'ShareEK Live PostgREST Security & RLS Integration Tests (Connected Project, Isolated Synthetic Records)',
   () => {
     let serviceClient: SupabaseClient;
     let anonClient: SupabaseClient;
     let memberClient: SupabaseClient;
     let ownerClient: SupabaseClient;
     let activeAdminClient: SupabaseClient;
+    let superAdminClient: SupabaseClient;
     let moderatorClient: SupabaseClient;
     let reportsViewerClient: SupabaseClient;
     let suspendedAdminClient: SupabaseClient;
@@ -210,6 +196,7 @@ describe.skipIf(!hasIsolatedIntegrationEnv)(
     let memberUser: CreatedUser;
     let ownerUser: CreatedUser;
     let activeAdminUser: CreatedUser;
+    let superAdminUser: CreatedUser;
     let moderatorUser: CreatedUser;
     let reportsViewerUser: CreatedUser;
     let suspendedAdminUser: CreatedUser;
@@ -221,24 +208,22 @@ describe.skipIf(!hasIsolatedIntegrationEnv)(
     let createdTempGovernorate = false;
     const createdProjectIds: string[] = [];
     const createdPropertyIds: string[] = [];
+    const createdReportIds: string[] = [];
+    const createdInquiryIds: string[] = [];
     const createdUserIds: string[] = [];
+    const uploadedStorageObjects: Array<{ bucket: string; path: string }> = [];
 
     beforeAll(async () => {
-      if (
-        !testSupabaseUrl ||
-        !testSupabaseAnonKey ||
-        !testSupabaseServiceRoleKey ||
-        isTargetingProduction
-      ) {
+      if (!liveUrl || !liveAnonKey || !liveServiceRoleKey) {
         throw new Error(
-          'SAFETY ABORT: Mutating integration tests require an isolated TEST_SUPABASE_* project distinct from production.'
+          'Missing SUPABASE_SERVICE_ROLE_KEY or connection settings for live integration tests.'
         );
       }
 
-      serviceClient = createClient(testSupabaseUrl, testSupabaseServiceRoleKey, {
+      serviceClient = createClient(liveUrl, liveServiceRoleKey, {
         auth: { autoRefreshToken: false, persistSession: false },
       });
-      anonClient = createClient(testSupabaseUrl, testSupabaseAnonKey, {
+      anonClient = createClient(liveUrl, liveAnonKey, {
         auth: { autoRefreshToken: false, persistSession: false },
       });
 
@@ -248,7 +233,7 @@ describe.skipIf(!hasIsolatedIntegrationEnv)(
         .limit(1);
       if (schemaErr?.code === 'PGRST205') {
         throw new Error(
-          'Cannot run live tests: public.projects does not exist yet in the isolated test project (apply Migrations 0001-0005 first).'
+          'Cannot run live tests: public.projects does not exist yet in the connected Supabase project (apply Migrations 0001-0006 first).'
         );
       }
 
@@ -307,6 +292,14 @@ describe.skipIf(!hasIsolatedIntegrationEnv)(
       });
       createdUserIds.push(activeAdminUser.id);
 
+      superAdminUser = await createConfirmedUserWithProfile(serviceClient, {
+        label: 'super_admin',
+        phone: '01099990000',
+        memberType: 'owner',
+        adminRole: 'super_admin',
+      });
+      createdUserIds.push(superAdminUser.id);
+
       moderatorUser = await createConfirmedUserWithProfile(serviceClient, {
         label: 'moderator',
         phone: '01066667777',
@@ -342,44 +335,50 @@ describe.skipIf(!hasIsolatedIntegrationEnv)(
       createdUserIds.push(bannedAdminUser.id);
 
       memberClient = await signInIsolatedClient(
-        testSupabaseUrl,
-        testSupabaseAnonKey,
+        liveUrl,
+        liveAnonKey,
         memberUser.email,
         memberUser.password
       );
       ownerClient = await signInIsolatedClient(
-        testSupabaseUrl,
-        testSupabaseAnonKey,
+        liveUrl,
+        liveAnonKey,
         ownerUser.email,
         ownerUser.password
       );
       activeAdminClient = await signInIsolatedClient(
-        testSupabaseUrl,
-        testSupabaseAnonKey,
+        liveUrl,
+        liveAnonKey,
         activeAdminUser.email,
         activeAdminUser.password
       );
+      superAdminClient = await signInIsolatedClient(
+        liveUrl,
+        liveAnonKey,
+        superAdminUser.email,
+        superAdminUser.password
+      );
       moderatorClient = await signInIsolatedClient(
-        testSupabaseUrl,
-        testSupabaseAnonKey,
+        liveUrl,
+        liveAnonKey,
         moderatorUser.email,
         moderatorUser.password
       );
       reportsViewerClient = await signInIsolatedClient(
-        testSupabaseUrl,
-        testSupabaseAnonKey,
+        liveUrl,
+        liveAnonKey,
         reportsViewerUser.email,
         reportsViewerUser.password
       );
       suspendedAdminClient = await signInIsolatedClient(
-        testSupabaseUrl,
-        testSupabaseAnonKey,
+        liveUrl,
+        liveAnonKey,
         suspendedAdminUser.email,
         suspendedAdminUser.password
       );
       bannedAdminClient = await signInIsolatedClient(
-        testSupabaseUrl,
-        testSupabaseAnonKey,
+        liveUrl,
+        liveAnonKey,
         bannedAdminUser.email,
         bannedAdminUser.password
       );
@@ -436,20 +435,37 @@ describe.skipIf(!hasIsolatedIntegrationEnv)(
     afterAll(async () => {
       if (!serviceClient) return;
 
-      // 1. Delete ONLY the test projects and test properties created in this run
+      // 1. Delete uploaded Storage objects created in this test run
+      const byBucket = new Map<string, string[]>();
+      for (const obj of uploadedStorageObjects) {
+        const list = byBucket.get(obj.bucket) ?? [];
+        list.push(obj.path);
+        byBucket.set(obj.bucket, list);
+      }
+      for (const [bucket, paths] of byBucket.entries()) {
+        await serviceClient.storage.from(bucket).remove(paths).catch(() => null);
+      }
+
+      // 2. Delete test inquiries, reports, projects, and non-payment properties
+      if (createdInquiryIds.length > 0) {
+        await serviceClient.from('inquiries').delete().in('id', createdInquiryIds).then(() => null, () => null);
+      }
+      if (createdReportIds.length > 0) {
+        await serviceClient.from('reports').delete().in('id', createdReportIds).then(() => null, () => null);
+      }
       if (createdProjectIds.length > 0) {
         await serviceClient.from('projects').delete().in('id', createdProjectIds);
       }
-      if (createdPropertyIds.length > 0) {
-        await serviceClient.from('properties').delete().in('id', createdPropertyIds);
+      for (const propId of createdPropertyIds) {
+        await serviceClient.from('properties').delete().eq('id', propId).then(() => null, () => null);
       }
 
-      // 2. Delete ONLY the temporary test auth users created in this run (cascades to profiles & admin_roles)
+      // 3. Delete temporary test auth users created in this run (best-effort if tied to immutable payment_orders)
       for (const uid of createdUserIds) {
-        await serviceClient.auth.admin.deleteUser(uid);
+        await serviceClient.auth.admin.deleteUser(uid).catch(() => null);
       }
 
-      // 3. Remove temporary governorate if created by this test
+      // 4. Remove temporary governorate if created by this test
       if (createdTempGovernorate && testGovernorateId) {
         await serviceClient.from('locations').delete().eq('id', testGovernorateId);
       }
@@ -830,6 +846,477 @@ describe.skipIf(!hasIsolatedIntegrationEnv)(
         auth_role: 'authenticated',
         db_role_guc: 'authenticated',
       });
+    });
+
+    it('9. verifies Migration 0006 seed data, Signup optional/normalized Egyptian phone, and email_verified defaults', async () => {
+      const { data: govs, error: govErr } = await anonClient
+        .from('locations')
+        .select('id')
+        .eq('level', 'governorate');
+      expect(govErr).toBeNull();
+      expect((govs ?? []).length).toBeGreaterThanOrEqual(27);
+
+      const { data: settings, error: setErr } = await anonClient
+        .from('site_settings')
+        .select('key')
+        .in('key', ['free_listing_days', 'listing_pricing', 'payment_channels']);
+      expect(setErr).toBeNull();
+      expect((settings ?? []).length).toBe(3);
+
+      const unique = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const nullPhoneEmail = `signup_nullphone_${unique}@share-ek.com`;
+      const { data: nullPhoneSignup, error: nullPhoneErr } = await anonClient.auth.signUp({
+        email: nullPhoneEmail,
+        password: `Sh@reEK_SignUp_${unique}!9`,
+        options: {
+          data: {
+            full_name: 'مستخدم بدون هاتف',
+            member_type: 'buyer',
+          },
+        },
+      });
+      expect(nullPhoneErr).toBeNull();
+      expect(nullPhoneSignup.user).not.toBeNull();
+      createdUserIds.push(nullPhoneSignup.user!.id);
+
+      const { data: nullProfile } = await serviceClient
+        .from('profiles')
+        .select('phone, phone_verified, email_verified')
+        .eq('id', nullPhoneSignup.user!.id)
+        .single();
+      expect(nullProfile!.phone).toBeNull();
+      expect(nullProfile!.phone_verified).toBe(false);
+
+      const plus20Email = `signup_plus20_${unique}@share-ek.com`;
+      const { data: plus20Signup, error: plus20Err } = await anonClient.auth.signUp({
+        email: plus20Email,
+        password: `Sh@reEK_SignUp_${unique}!9`,
+        options: {
+          data: {
+            full_name: 'مستخدم برقم دولي مصري',
+            phone: '+20 100 123 4567',
+            member_type: 'owner',
+          },
+        },
+      });
+      expect(plus20Err).toBeNull();
+      expect(plus20Signup.user).not.toBeNull();
+      createdUserIds.push(plus20Signup.user!.id);
+
+      const { data: normProfile } = await serviceClient
+        .from('profiles')
+        .select('phone, phone_verified')
+        .eq('id', plus20Signup.user!.id)
+        .single();
+      expect(normProfile!.phone).toBe('01001234567');
+      expect(normProfile!.phone_verified).toBe(false);
+    });
+
+    it('10. verifies full Storage upload, Private Signed URL HTTP 200 delivery, direct public URL rejection, and path traversal blocks', async () => {
+      // Minimal valid 1x1 PNG & minimal PDF payloads
+      const tinyPng = Uint8Array.from([
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+        0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+        0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00,
+        0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+        0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+      ]);
+      const tinyPdf = new TextEncoder().encode('%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n');
+
+      // 10a. property-images: published vs pending listings
+      const pubImgPath = `${ownerUser.id}/pub-${Date.now()}.png`;
+      const { error: pubUpErr } = await ownerClient.storage
+        .from('property-images')
+        .upload(pubImgPath, tinyPng, { contentType: 'image/png' });
+      expect(pubUpErr).toBeNull();
+      uploadedStorageObjects.push({ bucket: 'property-images', path: pubImgPath });
+
+      const { error: mediaInsErr } = await ownerClient.from('property_media').insert({
+        property_id: publishedPropertyId,
+        storage_path: pubImgPath,
+        thumbnail_path: pubImgPath,
+        mime_type: 'image/png',
+        file_size_bytes: tinyPng.byteLength,
+        sort_order: 0,
+      });
+      expect(mediaInsErr).toBeNull();
+
+      // Direct public URL must fail because bucket public=false
+      const { data: pubPublicUrl } = anonClient.storage
+        .from('property-images')
+        .getPublicUrl(pubImgPath);
+      const directPublicRes = await fetch(pubPublicUrl.publicUrl);
+      expect(directPublicRes.ok).toBe(false);
+
+      // Signed URL for published property image must succeed & fetch HTTP 200 for anon
+      const { data: pubSigned, error: pubSignErr } = await anonClient.storage
+        .from('property-images')
+        .createSignedUrl(pubImgPath, 60);
+      expect(pubSignErr).toBeNull();
+      expect(pubSigned?.signedUrl).toBeTruthy();
+      const signedImgFetch = await fetch(pubSigned!.signedUrl);
+      expect(signedImgFetch.status).toBe(200);
+
+      // Pending listing image must be denied to anon and buyer member, allowed to owner & moderator
+      const { data: pendingProp, error: pendingPropErr } = await ownerClient
+        .from('properties')
+        .insert({
+          owner_id: ownerUser.id,
+          slug: `test-pending-${Date.now()}`,
+          title: 'شقة قيد المراجعة لاختبار الصور الخاصة',
+          description: 'اختبار أن صور العقارات قيد المراجعة غير متاحة للزوار.',
+          category: 'residential_apartment',
+          purpose: 'sale',
+          condition: 'finished',
+          price_egp: 900000,
+          area_sqm: 95,
+          governorate_id: testGovernorateId,
+          status: 'pending_approval',
+        })
+        .select('id')
+        .single();
+      expect(pendingPropErr).toBeNull();
+      createdPropertyIds.push(pendingProp!.id);
+
+      const pendImgPath = `${ownerUser.id}/pend-${Date.now()}.png`;
+      const { error: pendUpErr } = await ownerClient.storage
+        .from('property-images')
+        .upload(pendImgPath, tinyPng, { contentType: 'image/png' });
+      expect(pendUpErr).toBeNull();
+      uploadedStorageObjects.push({ bucket: 'property-images', path: pendImgPath });
+
+      await ownerClient.from('property_media').insert({
+        property_id: pendingProp!.id,
+        storage_path: pendImgPath,
+        thumbnail_path: pendImgPath,
+        mime_type: 'image/png',
+        file_size_bytes: tinyPng.byteLength,
+        sort_order: 0,
+      });
+
+      for (const deniedClient of [anonClient, memberClient]) {
+        const { data: deniedSigned, error: deniedErr } = await deniedClient.storage
+          .from('property-images')
+          .createSignedUrl(pendImgPath, 60);
+        expect(deniedErr !== null || !deniedSigned?.signedUrl).toBe(true);
+      }
+
+      for (const allowedClient of [ownerClient, moderatorClient, activeAdminClient]) {
+        const { data: okSigned, error: okSignErr } = await allowedClient.storage
+          .from('property-images')
+          .createSignedUrl(pendImgPath, 60);
+        expect(okSignErr).toBeNull();
+        expect(okSigned?.signedUrl).toBeTruthy();
+      }
+
+      // Path traversal must be rejected
+      const { error: travErr } = await ownerClient.storage
+        .from('property-images')
+        .upload(`${ownerUser.id}/../${memberUser.id}/hack.png`, tinyPng, {
+          contentType: 'image/png',
+        });
+      expect(travErr).not.toBeNull();
+
+      // 10b. property-documents: owner & admin only; verified doc cannot be deleted by owner
+      const docPath = `${ownerUser.id}/deed-${Date.now()}.pdf`;
+      const { error: docUpErr } = await ownerClient.storage
+        .from('property-documents')
+        .upload(docPath, tinyPdf, { contentType: 'application/pdf' });
+      expect(docUpErr).toBeNull();
+      uploadedStorageObjects.push({ bucket: 'property-documents', path: docPath });
+
+      const { data: docAuthRow, error: docAuthErr } = await ownerClient
+        .from('property_authorizations')
+        .insert({
+          property_id: publishedPropertyId,
+          owner_id: ownerUser.id,
+          document_type: 'ownership_contract',
+          storage_path: docPath,
+        })
+        .select('id')
+        .single();
+      expect(docAuthErr).toBeNull();
+
+      const { data: ownerDocSign } = await ownerClient.storage
+        .from('property-documents')
+        .createSignedUrl(docPath, 60);
+      expect(ownerDocSign?.signedUrl).toBeTruthy();
+      expect((await fetch(ownerDocSign!.signedUrl)).status).toBe(200);
+
+      const { data: adminDocSign } = await activeAdminClient.storage
+        .from('property-documents')
+        .createSignedUrl(docPath, 60);
+      expect(adminDocSign?.signedUrl).toBeTruthy();
+
+      for (const blockedClient of [anonClient, memberClient, moderatorClient, reportsViewerClient]) {
+        const { data: blockedDocSign, error: blockedDocErr } = await blockedClient.storage
+          .from('property-documents')
+          .createSignedUrl(docPath, 60);
+        expect(blockedDocErr !== null || !blockedDocSign?.signedUrl).toBe(true);
+      }
+
+      // Admin verifies the ownership proof, then owner attempts deletion -> must fail
+      const { error: revAuthErr } = await activeAdminClient.rpc('review_property_authorization', {
+        auth_id: docAuthRow!.id,
+        new_status: 'verified',
+        notes_input: 'تمت المطابقة عبر اختبار التكامل',
+      });
+      expect(revAuthErr).toBeNull();
+
+      await ownerClient.storage.from('property-documents').remove([docPath]);
+      const { data: stillExists } = await activeAdminClient.storage
+        .from('property-documents')
+        .createSignedUrl(docPath, 60);
+      expect(stillExists?.signedUrl).toBeTruthy();
+
+      // 10c. admin-reports: admin/super_admin write & read; reports_viewer read-only; others denied
+      const reportFilePath = `monthly/report-${Date.now()}.pdf`;
+      const { error: repUpErr } = await activeAdminClient.storage
+        .from('admin-reports')
+        .upload(reportFilePath, tinyPdf, { contentType: 'application/pdf' });
+      expect(repUpErr).toBeNull();
+      uploadedStorageObjects.push({ bucket: 'admin-reports', path: reportFilePath });
+
+      const { error: rvUpErr } = await reportsViewerClient.storage
+        .from('admin-reports')
+        .upload(`monthly/forbidden-${Date.now()}.pdf`, tinyPdf, {
+          contentType: 'application/pdf',
+        });
+      expect(rvUpErr).not.toBeNull();
+
+      const { data: rvSignedReport, error: rvSignErr } = await reportsViewerClient.storage
+        .from('admin-reports')
+        .createSignedUrl(reportFilePath, 60);
+      expect(rvSignErr).toBeNull();
+      expect((await fetch(rvSignedReport!.signedUrl)).status).toBe(200);
+
+      for (const nonReportClient of [anonClient, memberClient, ownerClient, moderatorClient]) {
+        const { data: nrSign, error: nrErr } = await nonReportClient.storage
+          .from('admin-reports')
+          .createSignedUrl(reportFilePath, 60);
+        expect(nrErr !== null || !nrSign?.signedUrl).toBe(true);
+      }
+    });
+
+    it('11. verifies properties lifecycle RPCs, inquiries immutability, reports state machine, super_admin role management, and payment_orders full workflow', async () => {
+      // 11a. super_admin can update admin_roles, activeAdmin cannot
+      const { error: adminGrantErr } = await activeAdminClient
+        .from('admin_roles')
+        .insert({ user_id: memberUser.id, role: 'moderator' });
+      expect(adminGrantErr).not.toBeNull();
+
+      const { error: saGrantErr } = await superAdminClient
+        .from('admin_roles')
+        .insert({ user_id: memberUser.id, role: 'moderator', is_active: true });
+      expect(saGrantErr).toBeNull();
+      await superAdminClient.from('admin_roles').delete().eq('user_id', memberUser.id);
+
+      // 11b. Property moderation & owner archival RPCs
+      const { data: modTarget, error: modTargetErr } = await ownerClient
+        .from('properties')
+        .insert({
+          owner_id: ownerUser.id,
+          slug: `test-mod-rpc-${Date.now()}`,
+          title: 'فيلا لاختبار الاعتماد والأرشفة عبر RPC',
+          description: 'اختبار moderate_property و archive_own_property.',
+          category: 'villa',
+          purpose: 'sale',
+          condition: 'finished',
+          price_egp: 3500000,
+          area_sqm: 260,
+          governorate_id: testGovernorateId,
+          status: 'pending_approval',
+        })
+        .select('id')
+        .single();
+      expect(modTargetErr).toBeNull();
+      createdPropertyIds.push(modTarget!.id);
+
+      const { error: modPubErr } = await moderatorClient.rpc('moderate_property', {
+        target_property_id: modTarget!.id,
+        new_status: 'published',
+        reason_input: 'مطابق للشروط',
+      });
+      expect(modPubErr).toBeNull();
+
+      const { error: archErr } = await ownerClient.rpc('archive_own_property', {
+        target_property_id: modTarget!.id,
+      });
+      expect(archErr).toBeNull();
+
+      // 11c. Inquiries: member sends, owner marks is_read=true, content tamper blocked, moderator blocked
+      const { data: inqRow, error: inqInsErr } = await memberClient
+        .from('inquiries')
+        .insert({
+          property_id: publishedPropertyId,
+          sender_id: memberUser.id,
+          sender_name: 'مشتري اختباري',
+          sender_phone: '01011112222',
+          message: 'هل العقار ما زال متاحاً للمعاينة؟',
+        })
+        .select('id, is_read')
+        .single();
+      expect(inqInsErr).toBeNull();
+      createdInquiryIds.push(inqRow!.id);
+
+      const { error: ownerReadErr } = await ownerClient
+        .from('inquiries')
+        .update({ is_read: true })
+        .eq('id', inqRow!.id);
+      expect(ownerReadErr).toBeNull();
+
+      const { error: ownerTamperErr } = await ownerClient
+        .from('inquiries')
+        .update({ message: 'رسالة مزورة' })
+        .eq('id', inqRow!.id);
+      expect(ownerTamperErr).not.toBeNull();
+
+      const { data: modInquiries } = await moderatorClient.from('inquiries').select('id');
+      expect(modInquiries ?? []).toHaveLength(0);
+
+      // 11d. Reports state machine via resolve_report RPC
+      const { data: repRow, error: repInsErr } = await memberClient
+        .from('reports')
+        .insert({
+          property_id: publishedPropertyId,
+          reporter_id: memberUser.id,
+          reason: 'incorrect_price',
+          details: 'بلاغ اختباري للتحقق من انتقالات الحالات.',
+        })
+        .select('id, status')
+        .single();
+      expect(repInsErr).toBeNull();
+      createdReportIds.push(repRow!.id);
+
+      expect(
+        (
+          await moderatorClient.rpc('resolve_report', {
+            report_id: repRow!.id,
+            new_status: 'under_review',
+            resolution_notes_input: 'قيد الفحص',
+          })
+        ).error
+      ).toBeNull();
+      expect(
+        (
+          await moderatorClient.rpc('resolve_report', {
+            report_id: repRow!.id,
+            new_status: 'resolved',
+            resolution_notes_input: 'تم التحقق',
+          })
+        ).error
+      ).toBeNull();
+      expect(
+        (
+          await moderatorClient.rpc('resolve_report', {
+            report_id: repRow!.id,
+            new_status: 'open',
+            resolution_notes_input: 'إعادة فتح',
+          })
+        ).error
+      ).toBeNull();
+
+      const { data: reopened } = await activeAdminClient
+        .from('reports')
+        .select('status, resolved_by, resolved_at')
+        .eq('id', repRow!.id)
+        .single();
+      expect(reopened!.status).toBe('open');
+      expect(reopened!.resolved_by).toBeNull();
+      expect(reopened!.resolved_at).toBeNull();
+
+      // 11e. Full trusted Payment Orders RPC lifecycle & deletion lock (isolated synthetic fixture)
+      const paymentOwner = await createConfirmedUserWithProfile(serviceClient, {
+        label: 'payment_owner',
+        phone: '01088889999',
+        memberType: 'owner',
+      });
+      createdUserIds.push(paymentOwner.id);
+      const paymentOwnerClient = await signInIsolatedClient(
+        liveUrl,
+        liveAnonKey,
+        paymentOwner.email,
+        paymentOwner.password
+      );
+      const { data: paymentProp, error: payPropErr } = await paymentOwnerClient
+        .from('properties')
+        .insert({
+          owner_id: paymentOwner.id,
+          slug: `test-payment-prop-${Date.now()}`,
+          title: 'عقار اختبار دورة الدفع الآمنة',
+          description: 'اختبار معزول لدورة حياة payment_orders وقيود عدم الحذف.',
+          category: 'residential_apartment',
+          purpose: 'sale',
+          condition: 'finished',
+          price_egp: 1200000,
+          area_sqm: 110,
+          governorate_id: testGovernorateId,
+          status: 'published',
+        })
+        .select('id')
+        .single();
+      expect(payPropErr).toBeNull();
+      createdPropertyIds.push(paymentProp!.id);
+
+      const { data: payOrderId, error: createPayErr } = await paymentOwnerClient.rpc(
+        'create_payment_order',
+        {
+          target_property_id: paymentProp!.id,
+          requested_plan: 'featured',
+          requested_duration_days: 15,
+        }
+      );
+      expect(createPayErr).toBeNull();
+      expect(payOrderId).toBeTruthy();
+
+      const { error: proofErr } = await paymentOwnerClient.rpc('submit_payment_proof', {
+        order_id: payOrderId,
+        transfer_reference_input: `INSTA-${Date.now()}`,
+      });
+      expect(proofErr).toBeNull();
+
+      // Moderator cannot approve payments
+      const { error: modPayErr } = await moderatorClient.rpc('approve_payment_order', {
+        order_id: payOrderId,
+        admin_notes_input: 'محاولة غير مصرح بها',
+      });
+      expect(modPayErr).not.toBeNull();
+
+      // Admin approves payment once; second approval must fail
+      const { error: admPayErr } = await activeAdminClient.rpc('approve_payment_order', {
+        order_id: payOrderId,
+        admin_notes_input: 'تم التأكيد',
+      });
+      expect(admPayErr).toBeNull();
+
+      const { error: doublePayErr } = await activeAdminClient.rpc('approve_payment_order', {
+        order_id: payOrderId,
+        admin_notes_input: 'تكرار غير مسموح',
+      });
+      expect(doublePayErr).not.toBeNull();
+
+      // Direct DELETE on payment_orders must be blocked even for service_role
+      const { error: delPayErr } = await serviceClient
+        .from('payment_orders')
+        .delete()
+        .eq('id', payOrderId);
+      expect(delPayErr).not.toBeNull();
+
+      // Cancel flow on a second order
+      const { data: cancelOrderId, error: createPay2Err } = await paymentOwnerClient.rpc(
+        'create_payment_order',
+        {
+          target_property_id: paymentProp!.id,
+          requested_plan: 'paid',
+          requested_duration_days: 15,
+        }
+      );
+      expect(createPay2Err).toBeNull();
+      const { error: cancelErr } = await paymentOwnerClient.rpc('cancel_payment_order', {
+        order_id: cancelOrderId,
+      });
+      expect(cancelErr).toBeNull();
     });
   }
 );

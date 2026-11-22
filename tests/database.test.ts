@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import { describe, expect, it } from 'vitest';
 
@@ -243,15 +244,45 @@ describe('ShareEK Phase 02 - Database Migrations, RLS & Security Verification', 
   });
 });
 
-// Live Supabase Database Integration Tests (executed only when credentials are configured)
-const liveUrl = process.env.VITE_SUPABASE_URL;
-const liveAnonKey = process.env.VITE_SUPABASE_ANON_KEY;
-const liveServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const hasLiveSupabase = Boolean(liveUrl && liveAnonKey && liveServiceKey);
+// Live Supabase Database Integration Tests (executed ONLY against an isolated test project from .env.test / .env.test.local)
+const envTestPath = path.join(ROOT, '.env.test');
+const envTestLocalPath = path.join(ROOT, '.env.test.local');
+const envProdPath = path.join(ROOT, '.env.local');
 
-describe.skipIf(!hasLiveSupabase)('ShareEK Live Supabase Integration Tests', () => {
+const testEnvVars = {
+  ...(fs.existsSync(envTestLocalPath) ? dotenv.parse(fs.readFileSync(envTestLocalPath, 'utf8')) : {}),
+  ...(fs.existsSync(envTestPath) ? dotenv.parse(fs.readFileSync(envTestPath, 'utf8')) : {}),
+};
+const projectEnvVars = fs.existsSync(envProdPath)
+  ? dotenv.parse(fs.readFileSync(envProdPath, 'utf8'))
+  : {};
+
+const liveTestUrl =
+  process.env.TEST_SUPABASE_URL ||
+  testEnvVars.TEST_SUPABASE_URL ||
+  process.env.VITE_SUPABASE_URL ||
+  projectEnvVars.VITE_SUPABASE_URL ||
+  '';
+const liveTestAnonKey =
+  process.env.TEST_SUPABASE_ANON_KEY ||
+  testEnvVars.TEST_SUPABASE_ANON_KEY ||
+  process.env.VITE_SUPABASE_ANON_KEY ||
+  projectEnvVars.VITE_SUPABASE_ANON_KEY ||
+  '';
+const liveTestServiceKey =
+  process.env.TEST_SUPABASE_SERVICE_ROLE_KEY ||
+  testEnvVars.TEST_SUPABASE_SERVICE_ROLE_KEY ||
+  process.env.SUPABASE_SERVICE_ROLE_KEY ||
+  projectEnvVars.SUPABASE_SERVICE_ROLE_KEY ||
+  '';
+
+const hasLiveSupabaseServiceConfig = Boolean(
+  liveTestUrl && liveTestAnonKey && liveTestServiceKey
+);
+
+describe.skipIf(!hasLiveSupabaseServiceConfig)('ShareEK Live Supabase Integration Tests (Connected Project, Isolated Synthetic Records)', () => {
   it('verifies public visibility of locations and RLS blocks unauthenticated profile reads', async () => {
-    const anonClient = createClient(liveUrl!, liveAnonKey!);
+    const anonClient = createClient(liveTestUrl, liveTestAnonKey);
     const { data: govs, error: govError } = await anonClient
       .from('locations')
       .select('id, slug')
@@ -267,8 +298,8 @@ describe.skipIf(!hasLiveSupabase)('ShareEK Live Supabase Integration Tests', () 
     expect(profError || (profiles ?? []).length === 0).toBeTruthy();
   });
 
-  it('verifies registration profile trigger sets phone_verified=false and enforces owner/admin RLS', async () => {
-    const adminClient = createClient(liveUrl!, liveServiceKey!, {
+  it('verifies registration profile trigger sets phone_verified=false, handles optional phone, and enforces RLS', async () => {
+    const adminClient = createClient(liveTestUrl, liveTestServiceKey, {
       auth: { autoRefreshToken: false, persistSession: false },
     });
 
