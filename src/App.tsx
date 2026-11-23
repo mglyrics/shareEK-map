@@ -7,7 +7,9 @@ import { FavoritesPage } from './pages/FavoritesPage';
 import { HomePage } from './pages/HomePage';
 import {
   AboutPage,
+  AdvertisingPolicyPage,
   ContactPage,
+  DisclaimerPage,
   PrivacyPage,
   TermsPage,
 } from './pages/LegalAndInfoPages';
@@ -47,8 +49,9 @@ export default function App() {
               path="/dashboard"
               element={
                 <MemberSectionPage
+                  defaultTab="overview"
                   title="لوحة تحكم العضو"
-                  description="متابعة إحصائيات الإعلانات وطلبات الدفع وحالة الحساب."
+                  description="متابعة إحصائيات الإعلانات والاستفسارات الواردة وطلبات الترقية وحالة الحساب."
                 />
               }
             />
@@ -56,8 +59,9 @@ export default function App() {
               path="/my-ads"
               element={
                 <MemberSectionPage
+                  defaultTab="ads"
                   title="إعلاناتي العقارية"
-                  description="إدارة الإعلانات المنشورة والمنتهية وطلبات الترقية للباقات المدفوعة."
+                  description="إدارة الإعلانات المنشورة والمسودات والأرشفة وطلبات الترقية للباقات المدفوعة."
                 />
               }
             />
@@ -66,6 +70,7 @@ export default function App() {
               path="/profile"
               element={
                 <MemberSectionPage
+                  defaultTab="profile"
                   title="الملف الشخصي"
                   description="تحديث الاسم الكامل ورقم الهاتف ونوع العضوية."
                 />
@@ -75,6 +80,8 @@ export default function App() {
             <Route path="/about" element={<AboutPage />} />
             <Route path="/privacy" element={<PrivacyPage />} />
             <Route path="/terms" element={<TermsPage />} />
+            <Route path="/disclaimer" element={<DisclaimerPage />} />
+            <Route path="/ad-policy" element={<AdvertisingPolicyPage />} />
             <Route path="/contact" element={<ContactPage />} />
             <Route path={SECRET_ADMIN_PATH} element={<AdminDashboardPage />} />
             <Route path="*" element={<NotFoundPage />} />

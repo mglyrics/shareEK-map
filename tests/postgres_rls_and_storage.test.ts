@@ -16,6 +16,8 @@ const MIGRATION_FILES = [
   '202611210004_rls_policies.sql',
   '202611210005_storage_buckets_and_policies.sql',
   '202611210006_seed_locations_and_settings.sql',
+  '202611220007_legal_pages_contact_and_rpcs.sql',
+  '202611230008_backfill_profiles_role_rpc_and_media_order.sql',
 ] as const;
 
 type RoleActor =
@@ -181,7 +183,7 @@ describe('ShareEK Isolated Clean PostgreSQL Engine: Sequential Migrations, RLS, 
     await db?.close();
   });
 
-  it('1. executes Migrations 0001 through 0006 sequentially on a clean PostgreSQL database without SQL errors', async () => {
+  it('1. executes Migrations 0001 through 0008 sequentially on a clean PostgreSQL database without SQL errors', async () => {
     for (const file of MIGRATION_FILES) {
       const sql = fs.readFileSync(path.join(MIGRATIONS_DIR, file), 'utf8');
       await db.exec(sql);
@@ -194,7 +196,7 @@ describe('ShareEK Isolated Clean PostgreSQL Engine: Sequential Migrations, RLS, 
       WHERE schemaname = 'public'
       ORDER BY tablename;
     `);
-    expect(tables).toHaveLength(15);
+    expect(tables).toHaveLength(16);
     expect(tables.every((t) => t.rowsecurity === true)).toBe(true);
 
     const { rows: govs } = await db.query<{ cnt: string }>(
@@ -1142,4 +1144,387 @@ describe('ShareEK Isolated Clean PostgreSQL Engine: Sequential Migrations, RLS, 
     await freshDb.exec(verifySql);
     await freshDb.close();
   });
+
+  it('8. verifies Migration 0007 contact_messages RLS, legal_pages seed, advisory badges RPC, view increment, and admin moderation/settings audit RPCs', async () => {
+    // 1. legal_pages seeded and readable by anon
+    const { rows: legalRows } = await asActor(db, { kind: 'anon' }, (tx) =>
+      tx.query<{ key: string; value: Record<string, unknown> }>(
+        `SELECT key, value FROM public.site_settings WHERE key = 'legal_pages';`
+      )
+    );
+    expect(legalRows).toHaveLength(1);
+    expect(Object.keys(legalRows[0].value)).toEqual(
+      expect.arrayContaining(['privacy', 'terms', 'disclaimer', 'ad_policy'])
+    );
+
+    // 2. contact_messages insert allowed for anon & authenticated, rejected if spoofing admin_notes/status
+    await expect(
+      asActor(db, { kind: 'anon' }, (tx) =>
+        tx.exec(`
+          INSERT INTO public.contact_messages (sender_name, sender_email, subject, message, status)
+          VALUES ('زائر', 'guest@example.com', 'اختبار', 'رسالة تحاول تزوير الحالة.', 'resolved');
+        `)
+      )
+    ).rejects.toThrow();
+
+    await asActor(db, { kind: 'anon' }, (tx) =>
+      tx.exec(`
+        INSERT INTO public.contact_messages (sender_name, sender_email, subject, message)
+        VALUES ('زائر كريم', 'guest@example.com', 'استفسار', 'رسالة تواصل صالحة من زائر لاختبار النظام.');
+      `)
+    );
+    const { rows: buyerContact } = await asActor(db, { kind: 'authenticated', uid: uBuyer }, (tx) =>
+      tx.query<{ id: string }>(
+        `INSERT INTO public.contact_messages (user_id, sender_name, sender_email, subject, message)
+         VALUES ('${uBuyer}', 'مشتري مسجل', 'buyer@share-ek.com', 'سؤال عن باقة', 'أرغب في معرفة تفاصيل الاشتراك الشهري.')
+         RETURNING id;`
+      )
+    );
+
+    // Non-admin buyer sees only own message; moderator & anon see 0; admin sees both and can update
+    const { rows: buyerSee } = await asActor(db, { kind: 'authenticated', uid: uBuyer }, (tx) =>
+      tx.query<{ id: string }>(`SELECT id FROM public.contact_messages;`)
+    );
+    expect(buyerSee.map((r) => r.id)).toEqual([buyerContact[0].id]);
+
+    const { rows: modSee } = await asActor(db, { kind: 'authenticated', uid: uModerator }, (tx) =>
+      tx.query(`SELECT id FROM public.contact_messages;`)
+    );
+    expect(modSee).toHaveLength(0);
+
+    const { rows: adminSee } = await asActor(db, { kind: 'authenticated', uid: uAdmin }, (tx) =>
+      tx.query(`SELECT id FROM public.contact_messages;`)
+    );
+    expect(adminSee).toHaveLength(2);
+
+    // 3. Advisory badge & view counter on active published property (freshProp from test 6)
+    const { rows: activePub } = await asActor(db, { kind: 'anon' }, (tx) =>
+      tx.query<{ id: string; views_count: number }>(
+        `SELECT id, views_count FROM public.properties WHERE status = 'published' AND archived_at IS NULL LIMIT 1;`
+      )
+    );
+    expect(activePub).toHaveLength(1);
+    const activeId = activePub[0].id;
+    const prevViews = activePub[0].views_count;
+
+    await asActor(db, { kind: 'anon' }, (tx) =>
+      tx.exec(`SELECT public.increment_property_views('${activeId}');`)
+    );
+    const { rows: afterView } = await db.query<{ views_count: number }>(
+      `SELECT views_count FROM public.properties WHERE id = '${activeId}';`
+    );
+    expect(afterView[0].views_count).toBe(prevViews + 1);
+
+    // Authorize doc on active property and check get_verified_property_badges()
+    const { rows: activeAuth } = await asActor(db, { kind: 'authenticated', uid: uOwner }, (tx) =>
+      tx.query<{ id: string }>(
+        `INSERT INTO public.property_authorizations (property_id, owner_id, document_type, storage_path)
+         VALUES ('${activeId}', '${uOwner}', 'توكيل رسمي', '${uOwner}/badge-doc.pdf')
+         RETURNING id;`
+      )
+    );
+    await asActor(db, { kind: 'authenticated', uid: uAdmin }, (tx) =>
+      tx.exec(`SELECT public.review_property_authorization('${activeAuth[0].id}', 'verified', 'مؤشر إرشادي');`)
+    );
+
+    const { rows: badges } = await asActor(db, { kind: 'anon' }, (tx) =>
+      tx.query<{ property_id: string; has_verified_authorization: boolean; document_type: string }>(
+        `SELECT property_id, has_verified_authorization, document_type FROM public.get_verified_property_badges(ARRAY['${activeId}', '${publishedPropId}']::uuid[]);`
+      )
+    );
+    expect(badges).toHaveLength(1);
+    expect(badges[0]).toEqual({
+      property_id: activeId,
+      has_verified_authorization: true,
+      document_type: 'توكيل رسمي',
+    });
+
+    // 4. update_site_setting_with_log blocked for moderator/buyer, succeeds for admin & creates audit log
+    await expect(
+      asActor(db, { kind: 'authenticated', uid: uModerator }, (tx) =>
+        tx.exec(`SELECT public.update_site_setting_with_log('free_listing_days', '{"days": 14}'::jsonb, NULL);`)
+      )
+    ).rejects.toThrow();
+
+    await asActor(db, { kind: 'authenticated', uid: uAdmin }, (tx) =>
+      tx.exec(`SELECT public.update_site_setting_with_log('free_listing_days', '{"days": 10}'::jsonb, 'Updated free days');`)
+    );
+    const { rows: settingLog } = await db.query<{ action: string }>(
+      `SELECT action FROM public.admin_logs WHERE action = 'update_site_setting';`
+    );
+    expect(settingLog).toHaveLength(1);
+
+    // 5. admin_set_user_moderation blocks self-moderation & non-super_admin moderating super_admin, allows admin suspending buyer
+    await expect(
+      asActor(db, { kind: 'authenticated', uid: uAdmin }, (tx) =>
+        tx.exec(`SELECT public.admin_set_user_moderation('${uAdmin}', true, false, NULL, 'self');`)
+      )
+    ).rejects.toThrow();
+
+    await expect(
+      asActor(db, { kind: 'authenticated', uid: uAdmin }, (tx) =>
+        tx.exec(`SELECT public.admin_set_user_moderation('${uSuperAdmin}', true, false, NULL, 'escalate');`)
+      )
+    ).rejects.toThrow();
+
+    await asActor(db, { kind: 'authenticated', uid: uAdmin }, (tx) =>
+      tx.exec(`SELECT public.admin_set_user_moderation('${uBuyer}', true, false, NULL, 'مخالفة سياسة النشر');`)
+    );
+    const { rows: buyerMod } = await db.query<{ is_suspended: boolean }>(
+      `SELECT is_suspended FROM public.profiles WHERE id = '${uBuyer}';`
+    );
+    expect(buyerMod[0].is_suspended).toBe(true);
+  });
+
+  it('9. separates lifecycle updates from view counting, blocks direct views_count tampering, and allows real increment_property_views only', async () => {
+    const { rows: activePub } = await asActor(db, { kind: 'anon' }, (tx) =>
+      tx.query<{ id: string; views_count: number }>(
+        `SELECT id, views_count FROM public.properties WHERE status = 'published' AND archived_at IS NULL LIMIT 1;`
+      )
+    );
+    const propId = activePub[0].id;
+    const beforeViews = activePub[0].views_count;
+
+    // Updating price, title, description, or status NEVER increases views_count
+    await asActor(db, { kind: 'authenticated', uid: uOwner }, (tx) =>
+      tx.exec(`UPDATE public.properties SET price_egp = 5650000, title = 'عنوان محدث دون زيادة المشاهدات' WHERE id = '${propId}';`)
+    );
+    const { rows: afterPriceUpdate } = await db.query<{ views_count: number }>(
+      `SELECT views_count FROM public.properties WHERE id = '${propId}';`
+    );
+    expect(afterPriceUpdate[0].views_count).toBe(beforeViews);
+
+    // Direct client tampering with views_count fails even if caller attempts set_config('app.shareek_view_increment', '1', true)
+    await expect(
+      asActor(db, { kind: 'authenticated', uid: uOwner }, (tx) =>
+        tx.exec(`
+          SELECT set_config('app.shareek_view_increment', '1', true);
+          UPDATE public.properties SET views_count = views_count + 50 WHERE id = '${propId}';
+        `)
+      )
+    ).rejects.toThrow();
+
+    // Owner self-view does NOT inflate views_count, while real visitor view increments by +1
+    await asActor(db, { kind: 'authenticated', uid: uOwner }, (tx) =>
+      tx.exec(`SELECT public.increment_property_views('${propId}');`)
+    );
+    const { rows: afterOwnerView } = await db.query<{ views_count: number }>(
+      `SELECT views_count FROM public.properties WHERE id = '${propId}';`
+    );
+    expect(afterOwnerView[0].views_count).toBe(beforeViews);
+
+    await asActor(db, { kind: 'anon' }, (tx) =>
+      tx.exec(`SELECT public.increment_property_views('${propId}');`)
+    );
+    const { rows: afterVisitorView } = await db.query<{ views_count: number }>(
+      `SELECT views_count FROM public.properties WHERE id = '${propId}';`
+    );
+    expect(afterVisitorView[0].views_count).toBe(beforeViews + 1);
+
+    // Non-published / expired listing NEVER increments via increment_property_views
+    const { rows: expBefore } = await db.query<{ views_count: number }>(
+      `SELECT views_count FROM public.properties WHERE id = '${expiredPropId}';`
+    );
+    await asActor(db, { kind: 'anon' }, (tx) =>
+      tx.exec(`SELECT public.increment_property_views('${expiredPropId}');`)
+    );
+    const { rows: expAfter } = await db.query<{ views_count: number }>(
+      `SELECT views_count FROM public.properties WHERE id = '${expiredPropId}';`
+    );
+    expect(expAfter[0].views_count).toBe(expBefore[0].views_count);
+  });
+
+  it('10. enforces super_admin role RPC auditing, blocks non-super_admin & self-lockout, and protects custom unrelated storage policies', async () => {
+    // Ordinary user, moderator, and admin CANNOT call admin_set_admin_role or bootstrap_first_super_admin
+    for (const actorUid of [uOwner, uModerator, uAdmin]) {
+      await expect(
+        asActor(db, { kind: 'authenticated', uid: actorUid }, (tx) =>
+          tx.exec(`SELECT public.admin_set_admin_role('${uOwner}', 'admin', true);`)
+        )
+      ).rejects.toThrow();
+
+      await expect(
+        asActor(db, { kind: 'authenticated', uid: actorUid }, (tx) =>
+          tx.exec(`SELECT public.bootstrap_first_super_admin('owner@share-ek.com');`)
+        )
+      ).rejects.toThrow();
+    }
+
+    // Super admin CANNOT deactivate or demote themselves (and cannot remove the last active super_admin)
+    await expect(
+      asActor(db, { kind: 'authenticated', uid: uSuperAdmin }, (tx) =>
+        tx.exec(`SELECT public.admin_set_admin_role('${uSuperAdmin}', 'super_admin', false);`)
+      )
+    ).rejects.toThrow();
+
+    await expect(
+      asActor(db, { kind: 'authenticated', uid: uSuperAdmin }, (tx) =>
+        tx.exec(`DELETE FROM public.admin_roles WHERE user_id = '${uSuperAdmin}';`)
+      )
+    ).rejects.toThrow();
+
+    // Super admin CAN assign moderator role via RPC and action is logged in admin_logs
+    await asActor(db, { kind: 'authenticated', uid: uSuperAdmin }, (tx) =>
+      tx.exec(`SELECT public.admin_set_admin_role('${uOwner}', 'moderator', true);`)
+    );
+    const { rows: roleLog } = await db.query<{ action: string; target_id: string }>(
+      `SELECT action, target_id FROM public.admin_logs WHERE action = 'admin_set_admin_role' AND target_id = '${uOwner}';`
+    );
+    expect(roleLog).toHaveLength(1);
+
+    // Re-running 0005 preserves unrelated non-ShareEK bucket policies while dropping global USING(true) policies
+    await db.exec(`
+      INSERT INTO storage.buckets (id, name, public) VALUES ('custom-avatars', 'custom-avatars', false) ON CONFLICT DO NOTHING;
+      CREATE POLICY "allow_custom_avatars" ON storage.objects FOR SELECT TO anon USING (bucket_id = 'custom-avatars');
+      CREATE POLICY "public_blanket_leak" ON storage.objects FOR SELECT TO anon USING (true);
+    `);
+    await db.exec(fs.readFileSync(path.join(MIGRATIONS_DIR, '202611210005_storage_buckets_and_policies.sql'), 'utf8'));
+
+    const { rows: remainingCustom } = await db.query<{ policyname: string }>(
+      `SELECT policyname FROM pg_policies WHERE schemaname = 'storage' AND tablename = 'objects' AND policyname IN ('allow_custom_avatars', 'public_blanket_leak');`
+    );
+    expect(remainingCustom.map((r) => r.policyname)).toEqual(['allow_custom_avatars']);
+  });
+
+  it('11. enforces unique contiguous property_media sort_order on delete/reorder/add and prevents duplicates', async () => {
+    const { rows: mediaProp } = await asActor(db, { kind: 'authenticated', uid: uOwner }, (tx) =>
+      tx.query<{ id: string }>(
+        `INSERT INTO public.properties (
+          owner_id, slug, title, description, category, purpose, condition,
+          price_egp, area_sqm, governorate_id, status
+        ) VALUES (
+          '${uOwner}', 'media-order-test', 'شقة لاختبار ترتيب الصور',
+          'وصف كافٍ لاختبار منع تكرار ترتيب الصور عند الإضافة والحذف وإعادة الترتيب.',
+          'residential_apartment', 'sale', 'finished', 1800000, 110, '${cairoId}', 'draft'
+        ) RETURNING id;`
+      )
+    );
+    const mediaPropId = mediaProp[0].id;
+
+    const { rows: insertedMedia } = await asActor(db, { kind: 'authenticated', uid: uOwner }, (tx) =>
+      tx.query<{ id: string; sort_order: number }>(
+        `INSERT INTO public.property_media (property_id, storage_path, thumbnail_path, mime_type, file_size_bytes, sort_order)
+         VALUES
+           ('${mediaPropId}', '${uOwner}/${mediaPropId}/1.webp', '${uOwner}/${mediaPropId}/1_thumb.webp', 'image/webp', 1000, 0),
+           ('${mediaPropId}', '${uOwner}/${mediaPropId}/2.webp', '${uOwner}/${mediaPropId}/2_thumb.webp', 'image/webp', 1000, 1),
+           ('${mediaPropId}', '${uOwner}/${mediaPropId}/3.webp', '${uOwner}/${mediaPropId}/3_thumb.webp', 'image/webp', 1000, 2)
+         RETURNING id, sort_order;`
+      )
+    );
+
+    // Duplicate sort_order on same property MUST be rejected by uq_property_media_sort_order
+    await expect(
+      asActor(db, { kind: 'authenticated', uid: uOwner }, (tx) =>
+        tx.exec(`
+          INSERT INTO public.property_media (property_id, storage_path, thumbnail_path, mime_type, file_size_bytes, sort_order)
+          VALUES ('${mediaPropId}', '${uOwner}/${mediaPropId}/dup.webp', '${uOwner}/${mediaPropId}/dup_thumb.webp', 'image/webp', 1000, 1);
+        `)
+      )
+    ).rejects.toThrow();
+
+    // Delete first image (sort_order 0), reorder [img3, img2], then append img4 at index 2 -> contiguous [0, 1, 2]
+    await asActor(db, { kind: 'authenticated', uid: uOwner }, (tx) =>
+      tx.exec(`DELETE FROM public.property_media WHERE id = '${insertedMedia[0].id}';`)
+    );
+    await asActor(db, { kind: 'authenticated', uid: uOwner }, (tx) =>
+      tx.exec(`SELECT public.reorder_property_media('${mediaPropId}', ARRAY['${insertedMedia[2].id}', '${insertedMedia[1].id}']::uuid[]);`)
+    );
+    await asActor(db, { kind: 'authenticated', uid: uOwner }, (tx) =>
+      tx.exec(`
+        INSERT INTO public.property_media (property_id, storage_path, thumbnail_path, mime_type, file_size_bytes, sort_order)
+        VALUES ('${mediaPropId}', '${uOwner}/${mediaPropId}/4.webp', '${uOwner}/${mediaPropId}/4_thumb.webp', 'image/webp', 1000, 2);
+      `)
+    );
+
+    const { rows: finalOrder } = await db.query<{ storage_path: string; sort_order: number }>(
+      `SELECT storage_path, sort_order FROM public.property_media WHERE property_id = '${mediaPropId}' ORDER BY sort_order;`
+    );
+    expect(finalOrder).toEqual([
+      { storage_path: `${uOwner}/${mediaPropId}/3.webp`, sort_order: 0 },
+      { storage_path: `${uOwner}/${mediaPropId}/2.webp`, sort_order: 1 },
+      { storage_path: `${uOwner}/${mediaPropId}/4.webp`, sort_order: 2 },
+    ]);
+  });
+
+  it('12. backfills legacy auth.users missing profiles safely without overwriting existing profiles and runs production_deployment.sql cleanly', async () => {
+    const legacyDb = new PGlite({ extensions: { pgcrypto, pg_trgm } });
+    await legacyDb.waitReady;
+    await setupSupabaseCompatShim(legacyDb);
+
+    // Simulate a legacy auth.users account created BEFORE ShareEK migrations existed, plus a custom existing profile
+    const uLegacyNoProfile = '20000000-0000-4000-8000-000000000001';
+    const uExistingProfile = '20000000-0000-4000-8000-000000000002';
+
+    await legacyDb.exec(`
+      INSERT INTO auth.users (id, email, raw_user_meta_data, email_confirmed_at)
+      VALUES
+        ('${uLegacyNoProfile}', 'legacy@share-ek.com', '{"full_name":"مستخدم قديم","phone":"+201011223344","member_type":"agent"}', now()),
+        ('${uExistingProfile}', 'existing@share-ek.com', '{"full_name":"اسم قديم في الميتاداتا","member_type":"buyer"}', now());
+    `);
+
+    // Run 0001 -> 0007 (on_auth_user_created only catches future users, so legacy accounts have no profiles yet)
+    for (const file of MIGRATION_FILES.slice(0, 7)) {
+      await legacyDb.exec(fs.readFileSync(path.join(MIGRATIONS_DIR, file), 'utf8'));
+    }
+
+    // Create an existing profile with a user-customized name BEFORE 0008 backfill runs
+    await legacyDb.exec(`
+      INSERT INTO public.profiles (id, full_name, email, email_verified, phone_verified, member_type)
+      VALUES ('${uExistingProfile}', 'الاسم المخصص الحالي', 'existing@share-ek.com', true, false, 'developer');
+    `);
+
+    // Run 0008 backfill (and re-run 0008 to confirm idempotency & no duplicates)
+    const m0008 = fs.readFileSync(path.join(MIGRATIONS_DIR, MIGRATION_FILES[7]), 'utf8');
+    await legacyDb.exec(m0008);
+    await legacyDb.exec(m0008);
+
+    const { rows: backfilled } = await legacyDb.query<{
+      id: string;
+      full_name: string;
+      email_verified: boolean;
+      phone: string | null;
+      phone_verified: boolean;
+      member_type: string;
+    }>(`SELECT id, full_name, email_verified, phone, phone_verified, member_type::text FROM public.profiles ORDER BY id;`);
+
+    expect(backfilled).toEqual([
+      {
+        id: uLegacyNoProfile,
+        full_name: 'مستخدم قديم',
+        email_verified: true,
+        phone: '01011223344',
+        phone_verified: false,
+        member_type: 'agent',
+      },
+      {
+        id: uExistingProfile,
+        full_name: 'الاسم المخصص الحالي',
+        email_verified: true,
+        phone: null,
+        phone_verified: false,
+        member_type: 'developer',
+      },
+    ]);
+
+    // bootstrap_first_super_admin succeeds once when no super_admin exists, and rejects a second call
+    await legacyDb.exec(`SELECT public.bootstrap_first_super_admin('legacy@share-ek.com');`);
+    await expect(
+      legacyDb.exec(`SELECT public.bootstrap_first_super_admin('existing@share-ek.com');`)
+    ).rejects.toThrow();
+
+    await legacyDb.close();
+
+    // Also verify unified supabase/production_deployment.sql executes cleanly end-to-end on a fresh DB
+    const bundleDb = new PGlite({ extensions: { pgcrypto, pg_trgm } });
+    await bundleDb.waitReady;
+    await setupSupabaseCompatShim(bundleDb);
+    const bundleSql = fs.readFileSync(path.join(ROOT, 'supabase', 'production_deployment.sql'), 'utf8');
+    await bundleDb.exec(bundleSql);
+
+    const { rows: bundleTables } = await bundleDb.query<{ tablename: string }>(
+      `SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename;`
+    );
+    expect(bundleTables).toHaveLength(16);
+    await bundleDb.close();
+  }, 30_000);
 });

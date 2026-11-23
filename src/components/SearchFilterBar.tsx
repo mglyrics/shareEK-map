@@ -1,7 +1,7 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { Search } from 'lucide-react';
-import { getGovernorates } from '../services/propertyService';
-import { PropertyCategory, PropertyPurpose } from '../types/database';
+import { getCitiesByGovernorate, getGovernorates } from '../services/propertyService';
+import { LocationNode, PropertyCategory, PropertyPurpose } from '../types/database';
 import { CATEGORY_LABELS, PURPOSE_LABELS } from '../utils/formatters';
 
 interface SearchFilterBarProps {
@@ -9,10 +9,12 @@ interface SearchFilterBarProps {
   purpose: PropertyPurpose | 'all';
   category: PropertyCategory | 'all';
   governorateId: string;
+  cityId?: string;
   onQueryChange: (value: string) => void;
   onPurposeChange: (value: PropertyPurpose | 'all') => void;
   onCategoryChange: (value: PropertyCategory | 'all') => void;
   onGovernorateChange: (value: string) => void;
+  onCityChange?: (value: string | undefined) => void;
   onSubmit?: () => void;
   submitLabel?: string;
 }
@@ -30,14 +32,41 @@ export const SearchFilterBar: React.FC<SearchFilterBarProps> = ({
   purpose,
   category,
   governorateId,
+  cityId,
   onQueryChange,
   onPurposeChange,
   onCategoryChange,
   onGovernorateChange,
+  onCityChange,
   onSubmit,
   submitLabel = 'بحث',
 }) => {
-  const governorates = getGovernorates();
+  const [governorates, setGovernorates] = useState<LocationNode[]>([]);
+  const [cities, setCities] = useState<LocationNode[]>([]);
+
+  useEffect(() => {
+    let active = true;
+    getGovernorates().then((list) => {
+      if (active) setGovernorates(list);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!onCityChange || !governorateId || governorateId === 'all') {
+      setCities([]);
+      return;
+    }
+    let active = true;
+    getCitiesByGovernorate(governorateId).then((list) => {
+      if (active) setCities(list);
+    });
+    return () => {
+      active = false;
+    };
+  }, [governorateId, onCityChange]);
 
   const handleFormSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -80,7 +109,7 @@ export const SearchFilterBar: React.FC<SearchFilterBarProps> = ({
 
       {/* Main Search Inputs */}
       <div className="grid grid-cols-1 gap-3 md:grid-cols-12">
-        <div className="md:col-span-5">
+        <div className={onCityChange && cities.length > 0 ? 'md:col-span-4' : 'md:col-span-5'}>
           <label htmlFor="property-search-keyword" className="sr-only">
             ابحث بالمدينة أو الحي أو اسم المشروع
           </label>
@@ -139,6 +168,29 @@ export const SearchFilterBar: React.FC<SearchFilterBarProps> = ({
             ))}
           </select>
         </div>
+
+        {onCityChange && cities.length > 0 ? (
+          <div className="md:col-span-1">
+            <label htmlFor="property-search-city" className="sr-only">
+              المدينة
+            </label>
+            <select
+              id="property-search-city"
+              value={cityId || 'all'}
+              onChange={(e) =>
+                onCityChange(e.target.value === 'all' ? undefined : e.target.value)
+              }
+              className="h-11 w-full rounded-lg border border-slate-300 bg-white px-2 text-xs text-navy-900 focus:border-emerald-600 focus:outline-none"
+            >
+              <option value="all">كل المدن</option>
+              {cities.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.nameAr}
+                </option>
+              ))}
+            </select>
+          </div>
+        ) : null}
 
         <div className="md:col-span-2">
           <button

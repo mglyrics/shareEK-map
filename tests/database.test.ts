@@ -72,14 +72,18 @@ describe('ShareEK Phase 02 - Database Migrations, RLS & Security Verification', 
       '202611210004_rls_policies.sql',
       '202611210005_storage_buckets_and_policies.sql',
       '202611210006_seed_locations_and_settings.sql',
+      '202611220007_legal_pages_contact_and_rpcs.sql',
+      '202611230008_backfill_profiles_role_rpc_and_media_order.sql',
     ]);
   });
 
-  it('defines all 15 required PostgreSQL tables with UUID keys and updated_at triggers', () => {
+  it('defines all 16 required PostgreSQL tables with UUID keys and updated_at triggers', () => {
     for (const table of REQUIRED_TABLES) {
       expect(fullSql).toMatch(new RegExp(`CREATE TABLE IF NOT EXISTS public\\.${table}\\b`));
       expect(fullSql).toContain(`'${table}'`);
     }
+    expect(fullSql).toMatch(/CREATE TABLE IF NOT EXISTS public\.contact_messages\b/);
+    expect(fullSql).toContain('trg_contact_messages_updated_at');
     expect(fullSql).toContain('gen_random_uuid()');
     expect(fullSql).toContain('public.set_updated_at()');
   });
@@ -102,16 +106,28 @@ describe('ShareEK Phase 02 - Database Migrations, RLS & Security Verification', 
     expect(fullSql).toContain('trg_protect_profile_sensitive_columns');
   });
 
-  it('enables RLS on all 15 tables and avoids unrestricted USING (true) policies', () => {
-    for (const table of REQUIRED_TABLES) {
+  it('enables RLS on all 16 tables and avoids unrestricted USING (true) policies', () => {
+    for (const table of [...REQUIRED_TABLES, 'contact_messages']) {
       expect(fullSql).toContain(`ALTER TABLE public.${table} ENABLE ROW LEVEL SECURITY;`);
     }
     const rlsSql = fs.readFileSync(
       path.join(MIGRATIONS_DIR, '202611210004_rls_policies.sql'),
       'utf8'
     );
+    const m0007Sql = fs.readFileSync(
+      path.join(MIGRATIONS_DIR, '202611220007_legal_pages_contact_and_rpcs.sql'),
+      'utf8'
+    );
     expect(rlsSql).not.toMatch(/USING\s*\(\s*true\s*\)/i);
     expect(rlsSql).not.toMatch(/WITH\s+CHECK\s*\(\s*true\s*\)/i);
+    expect(m0007Sql).not.toMatch(/USING\s*\(\s*true\s*\)/i);
+    expect(m0007Sql).not.toMatch(/WITH\s+CHECK\s*\(\s*true\s*\)/i);
+    expect(m0007Sql).not.toContain('CREATE OR REPLACE FUNCTION public.enforce_property_lifecycle_rules');
+    expect(m0007Sql).toContain('CREATE OR REPLACE FUNCTION public.guard_property_views_count');
+    expect(m0007Sql).toContain('CREATE OR REPLACE FUNCTION public.increment_property_views');
+    expect(m0007Sql).toContain('CREATE OR REPLACE FUNCTION public.get_verified_property_badges');
+    expect(m0007Sql).toContain('CREATE OR REPLACE FUNCTION public.update_site_setting_with_log');
+    expect(m0007Sql).toContain('CREATE OR REPLACE FUNCTION public.admin_set_user_moderation');
   });
 
   it('enforces RBAC separation, payment/log/report/inquiry immutability, and trusted RPCs', () => {
@@ -241,6 +257,65 @@ describe('ShareEK Phase 02 - Database Migrations, RLS & Security Verification', 
     expect(verificationSql).toContain('u_suspended_admin');
     expect(verificationSql).toContain('u_banned_admin');
     expect(verificationSql).toContain('u_admin');
+    expect(verificationSql).toContain("'contact_messages'");
+  });
+
+  it('keeps production_deployment.sql, inspect_live_database.sql, and frontend service RPC/table names aligned with Migrations 0001-0008', () => {
+    const bundleSql = fs.readFileSync(path.join(ROOT, 'supabase', 'production_deployment.sql'), 'utf8');
+    const inspectSql = fs.readFileSync(
+      path.join(ROOT, 'supabase', 'tests', 'inspect_live_database.sql'),
+      'utf8'
+    );
+
+    for (let i = 0; i < migrationFiles.length; i++) {
+      expect(bundleSql).toContain(`SECTION ${i + 1}/8: ${migrationFiles[i]}`);
+    }
+    expect(bundleSql).toContain("NOTIFY pgrst, 'reload schema';");
+    expect(inspectSql).toContain("'contact_messages'");
+    expect(inspectSql).toContain("'guard_property_views_count'");
+    expect(inspectSql).toContain("'admin_set_admin_role'");
+    expect(inspectSql).toContain("'bootstrap_first_super_admin'");
+    expect(inspectSql).toContain("'reorder_property_media'");
+
+    // Every table/view and RPC referenced in src/ must exist in migrations
+    const srcFiles: string[] = [];
+    const walk = (dir: string) => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) walk(full);
+        else if (/\.(ts|tsx)$/.test(entry.name)) srcFiles.push(full);
+      }
+    };
+    walk(path.join(ROOT, 'src'));
+
+    const usedTables = new Set<string>();
+    const usedRpcs = new Set<string>();
+    for (const file of srcFiles) {
+      const content = fs.readFileSync(file, 'utf8');
+      for (const m of content.matchAll(/supabase\s*\.\s*from\(\s*['"]([a-z0-9_]+)['"]\s*\)/g)) {
+        usedTables.add(m[1]);
+      }
+      for (const m of content.matchAll(/supabase\s*\.\s*rpc\(\s*['"]([a-z0-9_]+)['"]/g)) {
+        usedRpcs.add(m[1]);
+      }
+    }
+
+    expect(usedTables.size).toBeGreaterThan(0);
+    expect(usedRpcs.size).toBeGreaterThan(0);
+    for (const tbl of usedTables) {
+      expect(fullSql).toMatch(new RegExp(`public\\.${tbl}\\b`));
+    }
+    for (const fn of usedRpcs) {
+      expect(fullSql).toMatch(new RegExp(`CREATE OR REPLACE FUNCTION public\\.${fn}\\b`));
+    }
+
+    // adminService must not perform direct client upsert/insert/update on admin_roles
+    const adminServiceCode = fs.readFileSync(
+      path.join(ROOT, 'src', 'services', 'adminService.ts'),
+      'utf8'
+    );
+    expect(adminServiceCode).not.toMatch(/\.from\(\s*['"]admin_roles['"]\s*\)\s*\.\s*(upsert|insert|update|delete)/);
+    expect(adminServiceCode).toContain("rpc('admin_set_admin_role'");
   });
 });
 

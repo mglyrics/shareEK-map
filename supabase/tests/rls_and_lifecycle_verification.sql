@@ -1,10 +1,10 @@
 -- ShareEK - شريك العقاري
 -- Database Verification Script (PostgreSQL / Supabase SQL Editor)
--- Covers ALL 12 Security Controls across Migrations 0001-0006 inside a single ROLLBACK transaction.
+-- Covers Security Controls across Migrations 0001-0008 inside a single ROLLBACK transaction.
 
 BEGIN;
 
--- 1. Verify all 15 tables exist and have RLS enabled
+-- 1. Verify all 16 tables exist and have RLS enabled
 DO $$
 DECLARE
   expected_tables text[] := ARRAY[
@@ -22,7 +22,8 @@ DECLARE
     'admin_roles',
     'admin_logs',
     'export_jobs',
-    'site_settings'
+    'site_settings',
+    'contact_messages'
   ];
   t text;
   rls_enabled boolean;

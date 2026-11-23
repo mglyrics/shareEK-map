@@ -36,7 +36,8 @@ ON CONFLICT (id) DO UPDATE SET
   file_size_limit = EXCLUDED.file_size_limit,
   allowed_mime_types = EXCLUDED.allowed_mime_types;
 
--- 2. Storage Pre-cleanup: remove any legacy, blanket, or conflicting policies in pg_policies on storage.objects
+-- 2. Storage Pre-cleanup: remove only ShareEK-bucket policies or unrestricted global policies on storage.objects
+--    (never drop policies explicitly scoped to unrelated third-party buckets)
 DO $$
 DECLARE
   pol record;
@@ -49,11 +50,16 @@ BEGIN
       AND (
         COALESCE(qual, '') ~* '(property-images|property-documents|admin-reports)'
         OR COALESCE(with_check, '') ~* '(property-images|property-documents|admin-reports)'
-        OR (COALESCE(qual, '') <> '' AND COALESCE(qual, '') !~* 'bucket_id')
-        OR (COALESCE(with_check, '') <> '' AND COALESCE(with_check, '') !~* 'bucket_id')
-        OR COALESCE(qual, '') ~* '^\s*\(?\s*true\s*\)?\s*$'
-        OR COALESCE(with_check, '') ~* '^\s*\(?\s*true\s*\)?\s*$'
-        OR policyname ~* '^(property_images|property_documents|admin_reports|public|allow|give_users)'
+        OR policyname ~* '^(property_images|property_documents|admin_reports)_'
+        OR (
+          COALESCE(qual, '') !~* 'bucket_id'
+          AND COALESCE(with_check, '') !~* 'bucket_id'
+          AND (
+            COALESCE(qual, '') ~* '^\s*\(?\s*true\s*\)?\s*$'
+            OR COALESCE(with_check, '') ~* '^\s*\(?\s*true\s*\)?\s*$'
+            OR policyname ~* '^(public|allow|give_users)'
+          )
+        )
       )
   LOOP
     BEGIN

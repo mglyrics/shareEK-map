@@ -1,15 +1,26 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { ArrowLeft, Building, Landmark, ShieldCheck } from 'lucide-react';
 import { ImageWithFallback } from '../components/ImageWithFallback';
+import { PhaseNoticeBanner } from '../components/PhaseNoticeBanner';
 import { PropertyCard } from '../components/PropertyCard';
 import { SearchFilterBar } from '../components/SearchFilterBar';
 import { useFavorites } from '../hooks/useFavorites';
 import { getGovernmentProjects } from '../services/projectService';
 import { getFeaturedProperties } from '../services/propertyService';
-import { PropertyCategory, PropertyPurpose } from '../types/database';
 import {
-  ADMIN_WHATSAPP_NUMBER,
+  DEFAULT_FREE_LISTING_DAYS,
+  DEFAULT_LISTING_PRICING,
+  DEFAULT_PAYMENT_CHANNELS,
+  getPublicSettings,
+} from '../services/settingsService';
+import {
+  GovernmentProject,
+  PropertyCategory,
+  PropertyListing,
+  PropertyPurpose,
+} from '../types/database';
+import {
   PROJECT_STATUS_LABELS,
   PURPOSE_LABELS,
   buildWhatsAppLink,
@@ -24,16 +35,48 @@ export const HomePage: React.FC = () => {
   const [heroPurpose, setHeroPurpose] = useState<PropertyPurpose | 'all'>('all');
   const [heroCategory, setHeroCategory] = useState<PropertyCategory | 'all'>('all');
   const [heroGovernorate, setHeroGovernorate] = useState('all');
-
   const [showcasePurpose, setShowcasePurpose] = useState<PropertyPurpose | 'all'>('all');
 
-  const allFeatured = useMemo(() => getFeaturedProperties(6), []);
+  const [loading, setLoading] = useState(true);
+  const [allFeatured, setAllFeatured] = useState<PropertyListing[]>([]);
+  const [officialProjects, setOfficialProjects] = useState<GovernmentProject[]>([]);
+  const [schemaMissing, setSchemaMissing] = useState(false);
+  const [freeDays, setFreeDays] = useState(DEFAULT_FREE_LISTING_DAYS);
+  const [minPaidPrice, setMinPaidPrice] = useState(DEFAULT_LISTING_PRICING.paid['7'] ?? 50);
+  const [minFeaturedPrice, setMinFeaturedPrice] = useState(
+    DEFAULT_LISTING_PRICING.featured['7'] ?? 100
+  );
+  const [whatsappNumber, setWhatsappNumber] = useState(DEFAULT_PAYMENT_CHANNELS.whatsapp);
+
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+
+    Promise.all([
+      getFeaturedProperties(6),
+      getGovernmentProjects(),
+      getPublicSettings(),
+    ]).then(([propRes, projRes, settings]) => {
+      if (!active) return;
+      setAllFeatured(propRes.items);
+      setOfficialProjects(projRes.items.slice(0, 3));
+      setSchemaMissing(propRes.schemaMissing || projRes.schemaMissing || settings.schemaMissing);
+      setFreeDays(settings.freeListingDays);
+      setMinPaidPrice(Math.min(...Object.values(settings.pricing.paid || { '7': 50 })));
+      setMinFeaturedPrice(Math.min(...Object.values(settings.pricing.featured || { '7': 100 })));
+      setWhatsappNumber(settings.paymentChannels.whatsapp);
+      setLoading(false);
+    });
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
   const displayedProperties = useMemo(() => {
     if (showcasePurpose === 'all') return allFeatured;
     return allFeatured.filter((item) => item.purpose === showcasePurpose);
   }, [allFeatured, showcasePurpose]);
-
-  const officialProjects = useMemo(() => getGovernmentProjects().slice(0, 3), []);
 
   const handleHeroSearchSubmit = () => {
     const params = new URLSearchParams();
@@ -120,7 +163,7 @@ export const HomePage: React.FC = () => {
               عقارات مختارة في مصر
             </h2>
             <p className="mt-1.5 text-sm text-slate-600">
-              نماذج عرض أولية للتصميم تمثل الفئات السكنية والتجارية والإدارية والزراعية.
+              أحدث الإعلانات العقارية المنشورة والمميزة على المنصة.
             </p>
           </div>
 
@@ -162,16 +205,49 @@ export const HomePage: React.FC = () => {
           </div>
         </div>
 
-        <div className="mt-8 grid grid-cols-1 gap-6 md:grid-cols-2 lg:grid-cols-3">
-          {displayedProperties.map((property) => (
-            <PropertyCard
-              key={property.id}
-              property={property}
-              isFavorite={isFavorite(property.id)}
-              onToggleFavorite={toggleFavorite}
+        {schemaMissing ? (
+          <div className="mt-6">
+            <PhaseNoticeBanner
+              title="بانتظار تنفيذ ملفات الهجرة (Migrations 0001 - 0008) في Supabase"
+              description="مشروع Supabase متصل بالواجهة، لكن الجداول والدوال لم تُنشأ بعد على قاعدة البيانات. بعد تشغيل ملفات SQL في لوحة تحكم Supabase، ستظهر الإعلانات المنشورة هنا تلقائياً."
             />
-          ))}
-        </div>
+          </div>
+        ) : null}
+
+        {loading ? (
+          <div className="mt-8 grid grid-cols-1 gap-6 md:grid-cols-2 lg:grid-cols-3">
+            {[1, 2, 3].map((n) => (
+              <div
+                key={n}
+                className="h-80 animate-pulse rounded-xl border border-slate-200 bg-slate-100"
+              />
+            ))}
+          </div>
+        ) : displayedProperties.length > 0 ? (
+          <div className="mt-8 grid grid-cols-1 gap-6 md:grid-cols-2 lg:grid-cols-3">
+            {displayedProperties.map((property) => (
+              <PropertyCard
+                key={property.id}
+                property={property}
+                isFavorite={isFavorite(property.id)}
+                onToggleFavorite={toggleFavorite}
+              />
+            ))}
+          </div>
+        ) : (
+          <div className="mt-8 rounded-xl border border-slate-200 bg-white p-8 text-center">
+            <h3 className="text-base font-bold text-navy-900">لا توجد إعلانات منشورة في هذا التصنيف حالياً</h3>
+            <p className="mt-2 text-sm text-slate-600">
+              كن أول من يضيف إعلانه العقاري مجاناً لمدة {freeDays} أيام على شريك العقاري.
+            </p>
+            <Link
+              to="/ads/new"
+              className="mt-5 inline-flex min-h-[44px] items-center justify-center rounded-lg bg-emerald-600 px-5 py-2.5 text-sm font-bold text-white hover:bg-emerald-700"
+            >
+              أضف إعلانك الآن
+            </Link>
+          </div>
+        )}
       </section>
 
       {/* 3. Official Government & New Cities Projects (Strictly Separated) */}
@@ -200,45 +276,52 @@ export const HomePage: React.FC = () => {
             </Link>
           </div>
 
-          <div className="mt-8 grid grid-cols-1 gap-6 lg:grid-cols-3">
-            {officialProjects.map((proj) => (
-              <article
-                key={proj.id}
-                className="flex flex-col overflow-hidden rounded-xl border border-slate-200 bg-slate-50"
-              >
-                <div className="aspect-[16/9] w-full overflow-hidden bg-slate-200">
-                  <ImageWithFallback
-                    src={proj.coverImageUrl}
-                    alt={proj.projectName}
-                    fallbackTitle={proj.projectName}
-                    className="h-full w-full object-cover"
-                  />
-                </div>
-                <div className="flex flex-1 flex-col justify-between p-5">
-                  <div>
-                    <div className="flex flex-wrap items-center gap-2 text-xs font-semibold text-emerald-700">
-                      <span>{proj.projectCategory}</span>
-                      <span aria-hidden="true">·</span>
-                      <span>{PROJECT_STATUS_LABELS[proj.status]}</span>
+          {officialProjects.length > 0 ? (
+            <div className="mt-8 grid grid-cols-1 gap-6 lg:grid-cols-3">
+              {officialProjects.map((proj) => (
+                <article
+                  key={proj.id}
+                  className="flex flex-col overflow-hidden rounded-xl border border-slate-200 bg-slate-50"
+                >
+                  <div className="aspect-[16/9] w-full overflow-hidden bg-slate-200">
+                    <ImageWithFallback
+                      src={proj.coverImageUrl}
+                      alt={proj.projectName}
+                      fallbackTitle={proj.projectName}
+                      className="h-full w-full object-cover"
+                    />
+                  </div>
+                  <div className="flex flex-1 flex-col justify-between p-5">
+                    <div>
+                      <div className="flex flex-wrap items-center gap-2 text-xs font-semibold text-emerald-700">
+                        <span>{proj.projectCategory}</span>
+                        <span aria-hidden="true">·</span>
+                        <span>{PROJECT_STATUS_LABELS[proj.status]}</span>
+                      </div>
+                      <h3 className="mt-2 text-base font-bold leading-snug text-navy-900">
+                        {proj.projectName}
+                      </h3>
+                      <p className="mt-1 text-xs font-medium text-slate-600">
+                        {proj.authority} · {proj.governorateName} ({proj.cityName})
+                      </p>
+                      <p className="mt-3 line-clamp-3 text-sm leading-relaxed text-slate-600">
+                        {proj.description}
+                      </p>
                     </div>
-                    <h3 className="mt-2 text-base font-bold leading-snug text-navy-900">
-                      {proj.projectName}
-                    </h3>
-                    <p className="mt-1 text-xs font-medium text-slate-600">
-                      {proj.authority} · {proj.governorateName} ({proj.cityName})
-                    </p>
-                    <p className="mt-3 line-clamp-3 text-sm leading-relaxed text-slate-600">
-                      {proj.description}
-                    </p>
+                    <div className="mt-4 flex items-center justify-between border-t border-slate-200 pt-3 text-xs text-slate-500 tabular-nums">
+                      <span>{proj.announcementReference}</span>
+                      <span>{formatArabicDate(proj.announcementDate)}</span>
+                    </div>
                   </div>
-                  <div className="mt-4 flex items-center justify-between border-t border-slate-200 pt-3 text-xs text-slate-500 tabular-nums">
-                    <span>{proj.announcementReference}</span>
-                    <span>{formatArabicDate(proj.announcementDate)}</span>
-                  </div>
-                </div>
-              </article>
-            ))}
-          </div>
+                </article>
+              ))}
+            </div>
+          ) : (
+            <div className="mt-8 rounded-xl border border-slate-200 bg-slate-50 p-6 text-center text-sm text-slate-600">
+              لا توجد مشاريع حكومية مضافة بعد. لا يُعرض في هذا القسم سوى المشاريع التي تم التحقق
+              من مصدرها الرسمي واعتمادها عبر الإدارة.
+            </div>
+          )}
         </div>
       </section>
 
@@ -252,31 +335,31 @@ export const HomePage: React.FC = () => {
                 <span>نشر واضح وباقات مرنة</span>
               </div>
               <h2 className="mt-2 text-2xl font-extrabold text-white sm:text-3xl">
-                انشر إعلانك العقاري مجاناً لمدة 7 أيام أو اختر الباقة المميزة
+                انشر إعلانك العقاري مجاناً لمدة {freeDays} أيام أو اختر الباقة المميزة
               </h2>
               <p className="mt-3 max-w-2xl text-sm leading-relaxed text-slate-300">
-                الإعلانات المجانية تبقى منشورة لمدة 7 أيام كاملة من تاريخ النشر ثم تُزال تلقائياً
-                لضمان حداثة العروض. الباقات المدفوعة والمميزة تبدأ من 50 ج.م ويتم تفعيلها يدوياً
-                عبر إنستا باي وواتساب الإدارة ({ADMIN_WHATSAPP_NUMBER}) برقم مرجعي واضح.
+                الإعلانات المجانية تبقى منشورة لمدة {freeDays} أيام كاملة من تاريخ النشر ثم تنتهي
+                تلقائياً لضمان حداثة العروض. الباقات المدفوعة والمميزة تبدأ من {minPaidPrice} ج.م
+                ويتم تفعيلها يدوياً عبر إنستا باي وواتساب الإدارة ({whatsappNumber}) برقم مرجعي واضح.
               </p>
 
               <div className="mt-6 grid grid-cols-1 gap-4 sm:grid-cols-3">
                 <div className="rounded-xl border border-navy-700 bg-navy-800/70 p-4">
                   <div className="text-xs font-semibold text-slate-300">الإعلان المجاني</div>
                   <div className="mt-1 text-xl font-extrabold text-white tabular-nums">0 ج.م</div>
-                  <div className="mt-1 text-xs text-slate-400">نشر لمدة 7 أيام</div>
+                  <div className="mt-1 text-xs text-slate-400">نشر لمدة {freeDays} أيام</div>
                 </div>
                 <div className="rounded-xl border border-navy-700 bg-navy-800/70 p-4">
                   <div className="text-xs font-semibold text-slate-300">الإعلان المدفوع</div>
                   <div className="mt-1 text-xl font-extrabold text-emerald-400 tabular-nums">
-                    من 50 ج.م
+                    من {minPaidPrice} ج.م
                   </div>
                   <div className="mt-1 text-xs text-slate-400">7 / 15 / 30 يوماً</div>
                 </div>
                 <div className="rounded-xl border border-navy-700 bg-navy-800/70 p-4">
                   <div className="text-xs font-semibold text-slate-300">الإعلان المميز</div>
                   <div className="mt-1 text-xl font-extrabold text-emerald-400 tabular-nums">
-                    من 100 ج.م
+                    من {minFeaturedPrice} ج.م
                   </div>
                   <div className="mt-1 text-xs text-slate-400">أولوية ظهور + تمييز</div>
                 </div>
@@ -302,13 +385,14 @@ export const HomePage: React.FC = () => {
                   </Link>
                   <a
                     href={buildWhatsAppLink(
-                      'مرحباً إدارة شريك العقاري، أرغب في الاستفسار عن الباقات المدفوعة'
+                      'مرحباً إدارة شريك العقاري، أرغب في الاستفسار عن الباقات المدفوعة',
+                      whatsappNumber
                     )}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="flex min-h-[44px] items-center justify-center rounded-lg border border-navy-700 px-4 py-2.5 text-sm font-semibold text-slate-200 transition-colors hover:bg-navy-800"
                   >
-                    تواصل واتساب الإدارة ({ADMIN_WHATSAPP_NUMBER})
+                    تواصل واتساب الإدارة ({whatsappNumber})
                   </a>
                 </div>
               </div>

@@ -1,4 +1,5 @@
 import React from 'react';
+import { Link } from 'react-router-dom';
 import { RotateCcw, SlidersHorizontal } from 'lucide-react';
 import { PhaseNoticeBanner } from '../components/PhaseNoticeBanner';
 import { PropertyCard } from '../components/PropertyCard';
@@ -8,7 +9,7 @@ import { usePropertySearch } from '../hooks/usePropertySearch';
 import { PropertySearchFilters } from '../types/database';
 
 export const SearchPage: React.FC = () => {
-  const { filters, updateFilters, resetFilters, results } = usePropertySearch();
+  const { filters, updateFilters, resetFilters, results, loading } = usePropertySearch();
   const { isFavorite, toggleFavorite } = useFavorites();
 
   return (
@@ -18,7 +19,7 @@ export const SearchPage: React.FC = () => {
           بحث العقارات في مصر
         </h1>
         <p className="mt-1.5 text-sm text-slate-600">
-          صفّ النتائج حسب الغرض العقاري، الفئة، المحافظة، السعر، والمساحة.
+          صفّ النتائج حسب الغرض العقاري، الفئة، المحافظة، المدينة، السعر، والمساحة.
         </p>
       </div>
 
@@ -28,10 +29,12 @@ export const SearchPage: React.FC = () => {
         purpose={filters.purpose}
         category={filters.category}
         governorateId={filters.governorateId}
+        cityId={filters.cityId}
         onQueryChange={(query) => updateFilters({ query })}
         onPurposeChange={(purpose) => updateFilters({ purpose })}
         onCategoryChange={(category) => updateFilters({ category })}
         onGovernorateChange={(governorateId) => updateFilters({ governorateId })}
+        onCityChange={(cityId) => updateFilters({ cityId })}
         submitLabel="تطبيق البحث"
       />
 
@@ -137,21 +140,36 @@ export const SearchPage: React.FC = () => {
       {/* Results Header */}
       <div className="mt-6 flex flex-wrap items-center justify-between gap-2">
         <p className="text-sm font-semibold text-navy-900 tabular-nums">
-          عدد النتائج المتطابقة: {results.totalCount}
+          {loading ? 'جاري البحث في قاعدة البيانات...' : `عدد النتائج المتطابقة: ${results.totalCount}`}
         </p>
       </div>
 
-      {results.usingVisualExamples ? (
+      {results.schemaMissing ? (
         <div className="mt-4">
           <PhaseNoticeBanner
-            title="بيانات عرض مرئية للمرحلة الأولى"
-            description="النتائج المعروضة حالياً أمثلة مرئية للتأسيس البصري واختبار واجهة البحث. في المرحلة الثانية سيتم جلب العقارات والمناطق الهرمية مباشرة من قاعدة بيانات Supabase PostgreSQL."
+            title="قاعدة بيانات Supabase بانتظار تنفيذ ملفات الهجرة"
+            description="الواجهة متصلة بمشروع Supabase، لكن جداول العقارات والمناطق لم تُنشأ بعد (Migrations 0001 - 0008). نفّذ ملفات SQL في Supabase Dashboard لعرض النتائج الحية."
           />
         </div>
       ) : null}
 
-      {/* Property Results Grid or Empty State */}
-      {results.items.length > 0 ? (
+      {results.error ? (
+        <div className="mt-4 rounded-lg border border-red-200 bg-red-50 p-4 text-xs font-semibold text-red-700">
+          تعذر تحميل النتائج: {results.error}
+        </div>
+      ) : null}
+
+      {/* Property Results Grid or Loading/Empty State */}
+      {loading ? (
+        <div className="mt-6 grid grid-cols-1 gap-6 md:grid-cols-2 lg:grid-cols-3">
+          {[1, 2, 3, 4, 5, 6].map((idx) => (
+            <div
+              key={idx}
+              className="h-80 animate-pulse rounded-xl border border-slate-200 bg-slate-100"
+            />
+          ))}
+        </div>
+      ) : results.items.length > 0 ? (
         <div className="mt-6 grid grid-cols-1 gap-6 md:grid-cols-2 lg:grid-cols-3">
           {results.items.map((property) => (
             <PropertyCard
@@ -166,15 +184,23 @@ export const SearchPage: React.FC = () => {
         <div className="mt-8 rounded-xl border border-slate-200 bg-white p-10 text-center">
           <h2 className="text-lg font-bold text-navy-900">لا توجد عقارات مطابقة لخيارات البحث</h2>
           <p className="mt-2 text-sm text-slate-600">
-            جرّب توسيع نطاق السعر أو اختيار محافظة أخرى أو إعادة تعيين الفلاتر.
+            جرّب توسيع نطاق السعر أو اختيار محافظة أخرى أو إعادة تعيين الفلاتر، أو أضف إعلاناً جديداً.
           </p>
-          <button
-            type="button"
-            onClick={resetFilters}
-            className="mt-5 inline-flex min-h-[44px] items-center justify-center rounded-lg bg-navy-900 px-5 py-2.5 text-sm font-bold text-white hover:bg-navy-800"
-          >
-            عرض جميع العقارات المتاحة
-          </button>
+          <div className="mt-5 flex flex-wrap justify-center gap-3">
+            <button
+              type="button"
+              onClick={resetFilters}
+              className="inline-flex min-h-[44px] items-center justify-center rounded-lg bg-navy-900 px-5 py-2.5 text-sm font-bold text-white hover:bg-navy-800"
+            >
+              عرض جميع العقارات المتاحة
+            </button>
+            <Link
+              to="/ads/new"
+              className="inline-flex min-h-[44px] items-center justify-center rounded-lg bg-emerald-600 px-5 py-2.5 text-sm font-bold text-white hover:bg-emerald-700"
+            >
+              إضافة إعلان عقاري
+            </Link>
+          </div>
         </div>
       )}
 

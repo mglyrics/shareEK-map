@@ -405,7 +405,32 @@ REVOKE ALL ON FUNCTION public.enforce_property_lifecycle_rules() FROM PUBLIC, an
 
 DROP TRIGGER IF EXISTS trg_enforce_property_lifecycle ON public.properties;
 CREATE TRIGGER trg_enforce_property_lifecycle
-  BEFORE INSERT OR UPDATE ON public.properties
+  BEFORE INSERT OR UPDATE OF
+    owner_id,
+    slug,
+    title,
+    description,
+    category,
+    purpose,
+    condition,
+    price_egp,
+    area_sqm,
+    governorate_id,
+    city_id,
+    district_id,
+    address_details,
+    bedrooms,
+    bathrooms,
+    floor_number,
+    plan_type,
+    is_featured,
+    status,
+    rejection_reason,
+    published_at,
+    expires_at,
+    archived_at,
+    created_at
+  ON public.properties
   FOR EACH ROW
   EXECUTE FUNCTION public.enforce_property_lifecycle_rules();
 

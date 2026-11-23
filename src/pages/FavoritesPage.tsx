@@ -1,18 +1,35 @@
-import React, { useMemo } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Trash2 } from 'lucide-react';
 import { PropertyCard } from '../components/PropertyCard';
 import { useFavorites } from '../hooks/useFavorites';
-import { getFeaturedProperties } from '../services/propertyService';
+import { getPropertiesByIds } from '../services/propertyService';
+import { PropertyListing } from '../types/database';
 
 export const FavoritesPage: React.FC = () => {
   const { favoriteIds, isFavorite, toggleFavorite, clearFavorites } = useFavorites();
-  const allProperties = useMemo(() => getFeaturedProperties(20), []);
+  const [savedProperties, setSavedProperties] = useState<PropertyListing[]>([]);
+  const [loading, setLoading] = useState(true);
 
-  const savedProperties = useMemo(
-    () => allProperties.filter((item) => favoriteIds.includes(item.id)),
-    [allProperties, favoriteIds]
-  );
+  useEffect(() => {
+    let active = true;
+    if (favoriteIds.length === 0) {
+      setSavedProperties([]);
+      setLoading(false);
+      return;
+    }
+
+    setLoading(true);
+    getPropertiesByIds(favoriteIds).then((items) => {
+      if (!active) return;
+      setSavedProperties(items);
+      setLoading(false);
+    });
+
+    return () => {
+      active = false;
+    };
+  }, [favoriteIds]);
 
   return (
     <div className="mx-auto max-w-[1280px] px-4 py-8 sm:px-6 lg:px-8">
@@ -29,7 +46,7 @@ export const FavoritesPage: React.FC = () => {
         {savedProperties.length > 0 ? (
           <button
             type="button"
-            onClick={clearFavorites}
+            onClick={() => void clearFavorites()}
             className="inline-flex min-h-[40px] items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-4 py-2 text-xs font-bold text-slate-700 hover:bg-slate-50"
           >
             <Trash2 className="h-4 w-4" aria-hidden="true" />
@@ -38,14 +55,23 @@ export const FavoritesPage: React.FC = () => {
         ) : null}
       </div>
 
-      {savedProperties.length > 0 ? (
+      {loading ? (
+        <div className="mt-8 grid grid-cols-1 gap-6 md:grid-cols-2 lg:grid-cols-3">
+          {[1, 2, 3].map((n) => (
+            <div
+              key={n}
+              className="h-72 animate-pulse rounded-xl border border-slate-200 bg-slate-100"
+            />
+          ))}
+        </div>
+      ) : savedProperties.length > 0 ? (
         <div className="mt-8 grid grid-cols-1 gap-6 md:grid-cols-2 lg:grid-cols-3">
           {savedProperties.map((property) => (
             <PropertyCard
               key={property.id}
               property={property}
               isFavorite={isFavorite(property.id)}
-              onToggleFavorite={toggleFavorite}
+              onToggleFavorite={(propId) => void toggleFavorite(propId)}
             />
           ))}
         </div>

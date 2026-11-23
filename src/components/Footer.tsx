@@ -1,9 +1,23 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
+import { getPublicSettings } from '../services/settingsService';
 import { ADMIN_WHATSAPP_NUMBER, buildWhatsAppLink } from '../utils/formatters';
 
 export const Footer: React.FC = () => {
   const currentYear = new Date().getFullYear();
+  const [whatsappNumber, setWhatsappNumber] = useState(ADMIN_WHATSAPP_NUMBER);
+
+  useEffect(() => {
+    let active = true;
+    getPublicSettings().then((settings) => {
+      if (active && settings.paymentChannels.whatsapp) {
+        setWhatsappNumber(settings.paymentChannels.whatsapp);
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   return (
     <footer className="border-t border-slate-200 bg-navy-950 text-slate-300">
@@ -19,8 +33,9 @@ export const Footer: React.FC = () => {
               في جميع محافظات مصر الـ 27 والمدن الجديدة.
             </p>
             <p className="mt-4 max-w-lg text-xs leading-relaxed text-slate-400">
-              تنويه قانوني: منصة شريك العقاري هي منصة إعلانية لعرض العقارات فقط، وليست بائعاً أو
-              وسيطاً عقارياً ولا تضمن ملكية أو صحة أو قانونية الإعلانات المنشورة من قِبل المستخدمين.
+              تنويه قانوني: منصة شريك العقاري وسيط إعلاني وتقني لعرض العقارات فقط، ولا تضمن صحة أو
+              دقة أو أصالة ادعاءات المعلن أو المشتري أو إتمام المعاملات، دون أن يعفي ذلك المنصة من
+              الالتزامات القانونية التي لا يجوز استبعادها.
             </p>
           </div>
 
@@ -58,7 +73,7 @@ export const Footer: React.FC = () => {
 
           {/* Legal & Support */}
           <div>
-            <h2 className="text-sm font-bold text-white">المعلومات والدعم</h2>
+            <h2 className="text-sm font-bold text-white">السياسات والدعم</h2>
             <ul className="mt-4 space-y-2.5 text-sm">
               <li>
                 <Link to="/about" className="hover:text-white">
@@ -72,7 +87,17 @@ export const Footer: React.FC = () => {
               </li>
               <li>
                 <Link to="/terms" className="hover:text-white">
-                  الشروط والأحكام
+                  شروط الاستخدام
+                </Link>
+              </li>
+              <li>
+                <Link to="/disclaimer" className="hover:text-white">
+                  إخلاء المسؤولية
+                </Link>
+              </li>
+              <li>
+                <Link to="/ad-policy" className="hover:text-white">
+                  سياسة الإعلانات والمحتوى
                 </Link>
               </li>
               <li>
@@ -83,13 +108,16 @@ export const Footer: React.FC = () => {
               <li className="pt-1 text-xs text-slate-400">
                 واتساب الإدارة والتحقق المالي:{' '}
                 <a
-                  href={buildWhatsAppLink('مرحباً، أود الاستفسار عن منصة شريك العقاري')}
+                  href={buildWhatsAppLink(
+                    'مرحباً، أود الاستفسار عن منصة شريك العقاري',
+                    whatsappNumber
+                  )}
                   target="_blank"
                   rel="noopener noreferrer"
                   dir="ltr"
                   className="font-semibold text-emerald-400 hover:underline"
                 >
-                  {ADMIN_WHATSAPP_NUMBER}
+                  {whatsappNumber}
                 </a>
               </li>
             </ul>

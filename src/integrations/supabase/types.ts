@@ -62,6 +62,8 @@ export type DbExportFormat = 'pdf' | 'jpg';
 
 export type DbExportJobStatus = 'queued' | 'processing' | 'completed' | 'failed';
 
+export type DbContactMessageStatus = 'new' | 'in_progress' | 'resolved';
+
 export interface Database {
   public: {
     Tables: {
@@ -208,6 +210,7 @@ export interface Database {
           bedrooms?: number | null;
           bathrooms?: number | null;
           floor_number?: number | null;
+          status?: DbListingStatus;
         };
         Relationships: [];
       };
@@ -309,6 +312,8 @@ export interface Database {
           status: DbProjectStatus;
           cover_image_path: string | null;
           is_official_verified: boolean;
+          verified_by: string | null;
+          verified_at: string | null;
           created_by: string | null;
           created_at: string;
           updated_at: string;
@@ -341,6 +346,7 @@ export interface Database {
           description?: string;
           status?: DbProjectStatus;
           cover_image_path?: string | null;
+          is_official_verified?: boolean;
         };
         Relationships: [];
       };
@@ -381,6 +387,7 @@ export interface Database {
           sender_phone: string;
           sender_email?: string | null;
           message: string;
+          is_read?: boolean;
         };
         Update: {
           is_read?: boolean;
@@ -483,7 +490,6 @@ export interface Database {
           target_id: string | null;
           metadata: Json;
           created_at: string;
-          updated_at: string;
         };
         Insert: {
           id?: string;
@@ -500,7 +506,7 @@ export interface Database {
       export_jobs: {
         Row: {
           id: string;
-          requested_by: string;
+          requested_by: string | null;
           report_type: string;
           format: DbExportFormat;
           period_start: string | null;
@@ -518,6 +524,7 @@ export interface Database {
           format: DbExportFormat;
           period_start?: string | null;
           period_end?: string | null;
+          status?: DbExportJobStatus;
         };
         Update: {
           status?: DbExportJobStatus;
@@ -545,6 +552,39 @@ export interface Database {
           value?: Json;
           description?: string | null;
           updated_by?: string | null;
+        };
+        Relationships: [];
+      };
+      contact_messages: {
+        Row: {
+          id: string;
+          user_id: string | null;
+          sender_name: string;
+          sender_email: string;
+          sender_phone: string | null;
+          subject: string;
+          message: string;
+          status: DbContactMessageStatus;
+          admin_notes: string | null;
+          handled_by: string | null;
+          handled_at: string | null;
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: {
+          id?: string;
+          user_id?: string | null;
+          sender_name: string;
+          sender_email: string;
+          sender_phone?: string | null;
+          subject?: string;
+          message: string;
+        };
+        Update: {
+          status?: DbContactMessageStatus;
+          admin_notes?: string | null;
+          handled_by?: string | null;
+          handled_at?: string | null;
         };
         Relationships: [];
       };
@@ -654,6 +694,56 @@ export interface Database {
           allowed_roles: DbAdminRole[];
         };
         Returns: boolean;
+      };
+      increment_property_views: {
+        Args: {
+          target_property_id: string;
+        };
+        Returns: undefined;
+      };
+      get_verified_property_badges: {
+        Args: {
+          target_property_ids: string[];
+        };
+        Returns: Array<{
+          property_id: string;
+          has_verified_authorization: boolean;
+          document_type: string;
+          verified_at: string | null;
+        }>;
+      };
+      update_site_setting_with_log: {
+        Args: {
+          setting_key: string;
+          setting_value: Json;
+          setting_description?: string;
+        };
+        Returns: undefined;
+      };
+      admin_set_user_moderation: {
+        Args: {
+          target_user_id: string;
+          suspend_flag: boolean;
+          ban_flag: boolean;
+          suspend_until_input?: string | null;
+          reason_input?: string | null;
+        };
+        Returns: undefined;
+      };
+      admin_set_admin_role: {
+        Args: {
+          target_user_id: string;
+          new_role: DbAdminRole;
+          active_flag?: boolean;
+        };
+        Returns: undefined;
+      };
+      reorder_property_media: {
+        Args: {
+          target_property_id: string;
+          ordered_media_ids: string[];
+        };
+        Returns: undefined;
       };
     };
     Enums: {

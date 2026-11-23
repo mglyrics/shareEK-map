@@ -3,6 +3,11 @@ import type { Session } from '@supabase/supabase-js';
 import { isSupabaseConfigured, supabase, supabaseStatusMessage } from '../integrations/supabase/client';
 import type { DbMemberType } from '../integrations/supabase/types';
 import { MemberType, UserProfile } from '../types/database';
+import {
+  mapDbMemberTypeToDomain,
+  mapDomainMemberTypeToDb,
+  normalizeEgyptianPhoneInput,
+} from '../utils/formatters';
 
 export interface SignUpPayload {
   fullName: string;
@@ -10,6 +15,12 @@ export interface SignUpPayload {
   phone: string;
   memberType: DbMemberType;
   password: string;
+}
+
+export interface UpdateProfilePayload {
+  fullName: string;
+  phone: string;
+  memberType: MemberType;
 }
 
 export interface AuthActionResult {
@@ -30,25 +41,8 @@ export interface AuthContextValue {
   sendPasswordRecovery: (email: string) => Promise<AuthActionResult>;
   updatePassword: (newPassword: string) => Promise<AuthActionResult>;
   resendVerificationEmail: (email: string) => Promise<AuthActionResult>;
+  updateProfile: (payload: UpdateProfilePayload) => Promise<AuthActionResult>;
   refreshProfile: () => Promise<void>;
-}
-
-function mapDbMemberTypeToDomain(dbType: DbMemberType): MemberType {
-  switch (dbType) {
-    case 'owner':
-      return MemberType.PropertyOwner;
-    case 'developer':
-      return MemberType.Developer;
-    case 'agent':
-      return MemberType.Agent;
-    case 'broker':
-      return MemberType.Broker;
-    case 'tenant':
-      return MemberType.Tenant;
-    case 'buyer':
-    default:
-      return MemberType.Buyer;
-  }
 }
 
 const AuthContext = createContext<AuthContextValue>({
@@ -64,6 +58,7 @@ const AuthContext = createContext<AuthContextValue>({
   sendPasswordRecovery: async () => ({ error: supabaseStatusMessage }),
   updatePassword: async () => ({ error: supabaseStatusMessage }),
   resendVerificationEmail: async () => ({ error: supabaseStatusMessage }),
+  updateProfile: async () => ({ error: supabaseStatusMessage }),
   refreshProfile: async () => {},
 });
 
@@ -113,6 +108,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         phoneVerified: data.phone_verified,
         memberType: mapDbMemberTypeToDomain(data.member_type),
         avatarUrl: data.avatar_url ?? undefined,
+        isSuspended: data.is_suspended,
+        isBanned: data.is_banned,
+        suspendedUntil: data.suspended_until,
         createdAt: data.created_at,
       });
     }
@@ -261,6 +259,39 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     await loadProfileForSession(session);
   }, [loadProfileForSession, session]);
 
+  const updateProfile = useCallback(
+    async (payload: UpdateProfilePayload): Promise<AuthActionResult> => {
+      if (!supabase || !session?.user) {
+        return { error: supabaseStatusMessage };
+      }
+
+      const normalizedPhone = normalizeEgyptianPhoneInput(payload.phone);
+      if (normalizedPhone && !/^01[0125][0-9]{8}$/.test(normalizedPhone)) {
+        return {
+          error:
+            'يرجى إدخال رقم هاتف محمول مصري صحيح مكون من 11 رقماً (يبدأ بـ 010 أو 011 أو 012 أو 015).',
+        };
+      }
+
+      const { error } = await supabase
+        .from('profiles')
+        .update({
+          full_name: payload.fullName.trim(),
+          phone: normalizedPhone || null,
+          member_type: mapDomainMemberTypeToDb(payload.memberType),
+        })
+        .eq('id', session.user.id);
+
+      if (error) {
+        return { error: error.message };
+      }
+
+      await loadProfileForSession(session);
+      return { error: null };
+    },
+    [loadProfileForSession, session]
+  );
+
   const value: AuthContextValue = {
     user,
     session,
@@ -274,6 +305,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     sendPasswordRecovery,
     updatePassword,
     resendVerificationEmail,
+    updateProfile,
     refreshProfile,
   };
 
