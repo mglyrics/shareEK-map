@@ -16,6 +16,7 @@ import {
   Pencil,
   Phone,
   PlusCircle,
+  Shield,
   Sparkles,
   Trash2,
   Upload,
@@ -24,7 +25,9 @@ import { useAuth } from '../auth/AuthContext';
 import { ImageWithFallback } from '../components/ImageWithFallback';
 import { PhaseNoticeBanner } from '../components/PhaseNoticeBanner';
 import { PropertyListingForm } from '../components/PropertyListingForm';
+import { supabase } from '../integrations/supabase/client';
 import type { DbMemberType } from '../integrations/supabase/types';
+import { getActiveAdminRole } from '../services/adminService';
 import {
   archiveOwnProperty,
   cancelPaymentOrder,
@@ -49,6 +52,7 @@ import {
   type PublicPlatformSettings,
 } from '../services/settingsService';
 import {
+  AdminRole,
   ListingPlanType,
   ListingStatus,
   MemberType,
@@ -78,6 +82,9 @@ const DB_MEMBER_TYPE_OPTIONS: Array<{ value: DbMemberType; label: string }> = [
   { value: 'buyer', label: MEMBER_TYPE_LABELS[MemberType.Buyer] },
 ];
 
+const SECRET_ADMIN_PATH =
+  import.meta.env.VITE_ADMIN_ROUTE_PATH || '/portal-ops-shareek';
+
 export const LoginPage: React.FC = () => {
   const navigate = useNavigate();
   const {
@@ -96,6 +103,25 @@ export const LoginPage: React.FC = () => {
   const [submitting, setSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
+  const [activeAdminRole, setActiveAdminRole] = useState<AdminRole | null>(null);
+
+  useEffect(() => {
+    if (!isConnectedToBackend || !isAuthenticated || !user || user.isBanned || user.isSuspended) {
+      setActiveAdminRole(null);
+      return;
+    }
+
+    let mounted = true;
+    getActiveAdminRole(user.id).then((res) => {
+      if (mounted) {
+        setActiveAdminRole(res.role);
+      }
+    });
+
+    return () => {
+      mounted = false;
+    };
+  }, [isConnectedToBackend, isAuthenticated, user]);
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -105,13 +131,37 @@ export const LoginPage: React.FC = () => {
     setSubmitting(true);
 
     const res = await signIn(email, password);
-    setSubmitting(false);
-
     if (res.error) {
+      setSubmitting(false);
       setErrorMsg(res.error);
       return;
     }
 
+    if (supabase) {
+      const { data: authData } = await supabase.auth.getUser();
+      const uid = authData.user?.id;
+      if (uid) {
+        const [roleRes, profRes] = await Promise.all([
+          getActiveAdminRole(uid),
+          supabase
+            .from('profiles')
+            .select('is_suspended, is_banned')
+            .eq('id', uid)
+            .maybeSingle(),
+        ]);
+        if (
+          roleRes.role &&
+          !profRes.data?.is_suspended &&
+          !profRes.data?.is_banned
+        ) {
+          setSubmitting(false);
+          navigate(SECRET_ADMIN_PATH);
+          return;
+        }
+      }
+    }
+
+    setSubmitting(false);
     navigate('/dashboard');
   };
 
@@ -143,11 +193,20 @@ export const LoginPage: React.FC = () => {
             {user.email})
           </p>
           <div className="mt-6 flex flex-col gap-3">
+            {activeAdminRole ? (
+              <Link
+                to={SECRET_ADMIN_PATH}
+                className="flex min-h-[44px] items-center justify-center gap-2 rounded-lg bg-navy-900 px-4 text-sm font-bold text-white hover:bg-navy-800"
+              >
+                <Shield className="h-4 w-4" aria-hidden="true" />
+                <span>الانتقال إلى لوحة الإدارة</span>
+              </Link>
+            ) : null}
             <Link
               to="/dashboard"
               className="flex min-h-[44px] items-center justify-center rounded-lg bg-emerald-600 px-4 text-sm font-bold text-white hover:bg-emerald-700"
             >
-              الانتقال إلى لوحة التحكم
+              الانتقال إلى لوحة تحكم العضو
             </Link>
             <button
               type="button"
@@ -937,6 +996,7 @@ export const MemberSectionPage: React.FC<{
   const [paymentOrders, setPaymentOrders] = useState<PaymentOrderRecord[]>([]);
   const [authorizations, setAuthorizations] = useState<PropertyAuthorizationRecord[]>([]);
   const [loadingData, setLoadingData] = useState(false);
+  const [activeAdminRole, setActiveAdminRole] = useState<AdminRole | null>(null);
   const [actionMsg, setActionMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(
     null
   );
@@ -997,6 +1057,24 @@ export const MemberSectionPage: React.FC<{
       void loadMemberData();
     }
   }, [isAuthenticated, user?.id, loadMemberData]);
+
+  useEffect(() => {
+    if (!isConnectedToBackend || !isAuthenticated || !user || user.isBanned || user.isSuspended) {
+      setActiveAdminRole(null);
+      return;
+    }
+
+    let mounted = true;
+    getActiveAdminRole(user.id).then((res) => {
+      if (mounted) {
+        setActiveAdminRole(res.role);
+      }
+    });
+
+    return () => {
+      mounted = false;
+    };
+  }, [isConnectedToBackend, isAuthenticated, user]);
 
   const handleToggleInquiryRead = async (inq: PropertyInquiryRecord) => {
     const res = await markInquiryRead(inq.id, !inq.isRead);
@@ -1142,6 +1220,15 @@ export const MemberSectionPage: React.FC<{
 
         {isAuthenticated && user ? (
           <div className="flex flex-wrap items-center gap-2.5">
+            {activeAdminRole ? (
+              <Link
+                to={SECRET_ADMIN_PATH}
+                className="inline-flex min-h-[42px] items-center gap-2 rounded-lg bg-navy-900 px-4 text-xs font-bold text-white hover:bg-navy-800"
+              >
+                <Shield className="h-4 w-4" aria-hidden="true" />
+                <span>لوحة الإدارة</span>
+              </Link>
+            ) : null}
             <Link
               to="/ads/new"
               className="inline-flex min-h-[42px] items-center gap-2 rounded-lg bg-emerald-600 px-4 text-xs font-bold text-white hover:bg-emerald-700"
