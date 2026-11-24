@@ -473,7 +473,7 @@ export async function getProfilesForAdmin(): Promise<{
     .from('profiles')
     .select('*')
     .order('created_at', { ascending: false })
-    .limit(100);
+    .limit(500);
 
   if (error) return { items: [], error: error.message };
 
@@ -496,6 +496,20 @@ export async function getProfilesForAdmin(): Promise<{
   };
 }
 
+export async function getUserListingCountsForAdmin(): Promise<Record<string, number>> {
+  if (!supabase) return {};
+  const { data, error } = await supabase
+    .from('properties')
+    .select('owner_id')
+    .limit(2000);
+  if (error || !data) return {};
+  const counts: Record<string, number> = {};
+  for (const row of data) {
+    counts[row.owner_id] = (counts[row.owner_id] ?? 0) + 1;
+  }
+  return counts;
+}
+
 export async function moderateUserAccount(
   targetUserId: string,
   suspendFlag: boolean,
@@ -511,6 +525,44 @@ export async function moderateUserAccount(
     reason_input: reason?.trim() || null,
   });
   return { error: error ? error.message : null };
+}
+
+export async function deleteUserAsSuperAdmin(
+  targetUserId: string,
+  reason?: string
+): Promise<{ error: string | null }> {
+  if (!supabase) return { error: 'Supabase غير مهيأ.' };
+
+  const { data, error } = await supabase.rpc('super_admin_delete_user', {
+    target_user_id: targetUserId,
+    reason_input: reason?.trim() || null,
+  });
+
+  if (error) {
+    return { error: error.message };
+  }
+
+  if (data && typeof data === 'object' && !Array.isArray(data)) {
+    const payload = data as {
+      property_image_paths?: unknown;
+      document_paths?: unknown;
+    };
+    const imgPaths = Array.isArray(payload.property_image_paths)
+      ? payload.property_image_paths.filter((p): p is string => typeof p === 'string' && p.length > 0)
+      : [];
+    const docPaths = Array.isArray(payload.document_paths)
+      ? payload.document_paths.filter((p): p is string => typeof p === 'string' && p.length > 0)
+      : [];
+
+    if (imgPaths.length > 0) {
+      await supabase.storage.from('property-images').remove(imgPaths);
+    }
+    if (docPaths.length > 0) {
+      await supabase.storage.from('property-documents').remove(docPaths);
+    }
+  }
+
+  return { error: null };
 }
 
 export async function getAdminRolesList(): Promise<{

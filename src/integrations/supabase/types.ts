@@ -745,6 +745,13 @@ export interface Database {
         };
         Returns: undefined;
       };
+      super_admin_delete_user: {
+        Args: {
+          target_user_id: string;
+          reason_input?: string | null;
+        };
+        Returns: Json;
+      };
     };
     Enums: {
       member_type_enum: DbMemberType;

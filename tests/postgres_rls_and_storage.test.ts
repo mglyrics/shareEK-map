@@ -18,6 +18,7 @@ const MIGRATION_FILES = [
   '202611210006_seed_locations_and_settings.sql',
   '202611220007_legal_pages_contact_and_rpcs.sql',
   '202611230008_backfill_profiles_role_rpc_and_media_order.sql',
+  '202611240009_super_admin_delete_user.sql',
 ] as const;
 
 type RoleActor =
@@ -1526,5 +1527,117 @@ describe('ShareEK Isolated Clean PostgreSQL Engine: Sequential Migrations, RLS, 
     );
     expect(bundleTables).toHaveLength(16);
     await bundleDb.close();
+  }, 30_000);
+
+  it('13. enforces super_admin-only violating member deletion, protects admins and payment history, and cleans up non-financial user records', async () => {
+    const db = new PGlite({ extensions: { pgcrypto, pg_trgm } });
+    await db.waitReady;
+    await setupSupabaseCompatShim(db);
+    for (const file of MIGRATION_FILES) {
+      await db.exec(fs.readFileSync(path.join(MIGRATIONS_DIR, file), 'utf8'));
+    }
+    await grantDefaultSupabaseTablePrivileges(db);
+
+    const uSuper = '30000000-0000-4000-8000-000000000001';
+    const uAdmin = '30000000-0000-4000-8000-000000000002';
+    const uSpammer = '30000000-0000-4000-8000-000000000003';
+    const uPaidUser = '30000000-0000-4000-8000-000000000004';
+    const uReporter = '30000000-0000-4000-8000-000000000005';
+
+    await db.exec(`
+      INSERT INTO auth.users (id, email, raw_user_meta_data, email_confirmed_at)
+      VALUES
+        ('${uSuper}', 'super@share-ek.com', '{"full_name":"سوبر أدمن","phone":"01000000001","member_type":"owner"}', now()),
+        ('${uAdmin}', 'admin@share-ek.com', '{"full_name":"أدمن","phone":"01000000002","member_type":"owner"}', now()),
+        ('${uSpammer}', 'spam@share-ek.com', '{"full_name":"مخالف","phone":"01000000003","member_type":"broker"}', now()),
+        ('${uPaidUser}', 'paid@share-ek.com', '{"full_name":"عضو مدفوع","phone":"01000000004","member_type":"owner"}', now()),
+        ('${uReporter}', 'rep@share-ek.com', '{"full_name":"مبلغ","phone":"01000000005","member_type":"buyer"}', now());
+
+      INSERT INTO public.admin_roles (user_id, role, assigned_by, is_active)
+      VALUES
+        ('${uSuper}', 'super_admin', '${uSuper}', true),
+        ('${uAdmin}', 'admin', '${uSuper}', true);
+    `);
+
+    const { rows: govRows } = await db.query<{ id: string }>(
+      `SELECT id FROM public.locations WHERE level = 'governorate' LIMIT 1;`
+    );
+    const govId = govRows[0].id;
+
+    // Create a spammer listing with media, authorization doc, and a report + a paid user listing with a payment order
+    const spamPropId = '40000000-0000-4000-8000-000000000001';
+    const paidPropId = '40000000-0000-4000-8000-000000000002';
+
+    await db.exec(`
+      INSERT INTO public.properties (id, owner_id, slug, title, description, category, purpose, condition, price_egp, area_sqm, governorate_id, status)
+      VALUES
+        ('${spamPropId}', '${uSpammer}', 'spam-listing-1', 'إعلان مخالف تجريبي', 'وصف إعلان مخالف للاختبار فقط لا غير', 'residential_apartment', 'sale', 'finished', 1000000, 120, '${govId}', 'published'),
+        ('${paidPropId}', '${uPaidUser}', 'paid-listing-1', 'إعلان مدفوع تجريبي', 'وصف إعلان مدفوع للاختبار فقط لا غير', 'residential_apartment', 'sale', 'finished', 2000000, 150, '${govId}', 'published');
+
+      INSERT INTO public.property_media (property_id, storage_path, thumbnail_path, mime_type, file_size_bytes, sort_order)
+      VALUES ('${spamPropId}', '${uSpammer}/${spamPropId}/img1.jpg', '${uSpammer}/${spamPropId}/thumb1.jpg', 'image/jpeg', 12000, 0);
+
+      INSERT INTO public.property_authorizations (property_id, owner_id, document_type, storage_path)
+      VALUES ('${spamPropId}', '${uSpammer}', 'عقد ملكية', '${uSpammer}/${spamPropId}/doc.pdf');
+
+      INSERT INTO public.reports (property_id, reporter_id, reason)
+      VALUES ('${spamPropId}', '${uReporter}', 'إعلان وهمي');
+
+      INSERT INTO public.payment_orders (property_id, user_id, reference_code, plan_type, duration_days, amount_egp)
+      VALUES ('${paidPropId}', '${uPaidUser}', 'SHK-TESTPAID1', 'paid', 15, 90);
+    `);
+
+    // Regular admin CANNOT delete a user
+    await expect(
+      asActor(db, { kind: 'authenticated', uid: uAdmin }, (tx) =>
+        tx.query(`SELECT public.super_admin_delete_user('${uSpammer}', 'test');`)
+      )
+    ).rejects.toThrow(/super_admin/);
+
+    // Super admin CANNOT delete self or an active admin
+    await expect(
+      asActor(db, { kind: 'authenticated', uid: uSuper }, (tx) =>
+        tx.query(`SELECT public.super_admin_delete_user('${uSuper}', 'self');`)
+      )
+    ).rejects.toThrow(/own account/);
+
+    await expect(
+      asActor(db, { kind: 'authenticated', uid: uSuper }, (tx) =>
+        tx.query(`SELECT public.super_admin_delete_user('${uAdmin}', 'admin');`)
+      )
+    ).rejects.toThrow(/administrative role/);
+
+    // Super admin CANNOT delete a user with payment_orders (financial audit retention)
+    await expect(
+      asActor(db, { kind: 'authenticated', uid: uSuper }, (tx) =>
+        tx.query(`SELECT public.super_admin_delete_user('${uPaidUser}', 'paid');`)
+      )
+    ).rejects.toThrow(/طلبات دفع مالية/);
+
+    // Super admin CAN delete the violating spammer cleanly and receives storage paths to remove
+    const delResult = await asActor(db, { kind: 'authenticated', uid: uSuper }, (tx) =>
+      tx.query<{ res: { deleted_user_id: string; property_image_paths: string[]; document_paths: string[] } }>(
+        `SELECT public.super_admin_delete_user('${uSpammer}', 'نشر إعلانات وهمية') AS res;`
+      )
+    );
+
+    expect(delResult.rows[0].res.deleted_user_id).toBe(uSpammer);
+    expect(delResult.rows[0].res.property_image_paths.sort()).toEqual([
+      `${uSpammer}/${spamPropId}/img1.jpg`,
+      `${uSpammer}/${spamPropId}/thumb1.jpg`,
+    ]);
+    expect(delResult.rows[0].res.document_paths).toEqual([`${uSpammer}/${spamPropId}/doc.pdf`]);
+
+    const { rows: remainingSpammer } = await db.query(
+      `SELECT id FROM public.profiles WHERE id = '${uSpammer}';`
+    );
+    expect(remainingSpammer).toHaveLength(0);
+
+    const { rows: deletionLogs } = await db.query<{ action: string }>(
+      `SELECT action FROM public.admin_logs WHERE action = 'super_admin_delete_user' AND target_id = '${uSpammer}';`
+    );
+    expect(deletionLogs).toHaveLength(1);
+
+    await db.close();
   }, 30_000);
 });

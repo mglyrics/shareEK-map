@@ -9,6 +9,7 @@ import {
   FileCheck2,
   Mail,
   Shield,
+  Trash2,
   Users,
   XCircle,
 } from 'lucide-react';
@@ -26,6 +27,7 @@ import {
   approvePaymentOrder,
   assignOrUpdateAdminRole,
   createExportReportJob,
+  deleteUserAsSuperAdmin,
   getActiveAdminRole,
   getAdminLogs,
   getAdminRolesList,
@@ -39,6 +41,7 @@ import {
   getPropertiesForModeration,
   getReportsForAdmin,
   getReportsSummaryStats,
+  getUserListingCountsForAdmin,
   moderateProperty,
   moderateUserAccount,
   rejectPaymentOrder,
@@ -147,10 +150,14 @@ export const AdminDashboardPage: React.FC = () => {
   const [exportPeriodEnd, setExportPeriodEnd] = useState('');
   const [exporting, setExporting] = useState(false);
 
-  // Super Admin Role assignment state
+  // Super Admin Role assignment & user management state
   const [roleTargetUserId, setRoleTargetUserId] = useState('');
   const [roleTargetEnum, setRoleTargetEnum] = useState<DbAdminRole>('moderator');
   const [roleActiveFlag, setRoleActiveFlag] = useState(true);
+  const [userListingCounts, setUserListingCounts] = useState<Record<string, number>>({});
+  const [userSearchQuery, setUserSearchQuery] = useState('');
+  const [confirmDeleteUserId, setConfirmDeleteUserId] = useState<string | null>(null);
+  const [deletingUserId, setDeletingUserId] = useState<string | null>(null);
 
   const showFeedback = useCallback((type: 'ok' | 'err', text: string) => {
     setFeedback({ type, text });
@@ -223,6 +230,7 @@ export const AdminDashboardPage: React.FC = () => {
       logsRes,
       pubSettings,
       rolesRes,
+      listingCountsMap,
     ] = await Promise.all([
       getReportsSummaryStats(),
       getExportJobsForAdmin(),
@@ -239,6 +247,7 @@ export const AdminDashboardPage: React.FC = () => {
       verifiedRole === AdminRole.SuperAdmin
         ? getAdminRolesList()
         : Promise.resolve({ items: [] as AdminRoleRecord[], error: null }),
+      getUserListingCountsForAdmin(),
     ]);
 
     setStats(statsRes.stats);
@@ -254,6 +263,7 @@ export const AdminDashboardPage: React.FC = () => {
     setAdminLogs(logsRes.items);
     setSettings(pubSettings);
     setAdminRoles(rolesRes.items);
+    setUserListingCounts(listingCountsMap);
   }, [verifiedRole, user, propStatusFilter]);
 
   useEffect(() => {
@@ -1010,78 +1020,192 @@ export const AdminDashboardPage: React.FC = () => {
               ) : null}
 
               <section className="rounded-xl border border-slate-200 bg-white p-6">
-                <div className="flex items-center gap-2">
-                  <Users className="h-5 w-5 text-navy-900" />
-                  <h2 className="text-base font-bold text-navy-900">
-                    حسابات المستخدمين ({profiles.length})
-                  </h2>
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="flex items-center gap-2">
+                    <Users className="h-5 w-5 text-navy-900" />
+                    <h2 className="text-base font-bold text-navy-900">
+                      حسابات المستخدمين ({profiles.length})
+                    </h2>
+                  </div>
+                  <input
+                    type="search"
+                    value={userSearchQuery}
+                    onChange={(e) => setUserSearchQuery(e.target.value)}
+                    placeholder="بحث بالاسم أو البريد أو رقم الهاتف..."
+                    className="h-9 w-full rounded-lg border border-slate-300 px-3 text-xs sm:w-72"
+                  />
                 </div>
                 <div className="mt-4 divide-y divide-slate-100 text-xs">
-                  {profiles.map((prof) => (
-                    <div
-                      key={prof.id}
-                      className="flex flex-wrap items-center justify-between gap-3 py-3"
-                    >
-                      <div>
-                        <span className="font-bold text-navy-900">{prof.fullName}</span> ·{' '}
-                        <span dir="ltr">{prof.email}</span> ·{' '}
-                        <span>{MEMBER_TYPE_LABELS[prof.memberType]}</span> ·{' '}
-                        <span>{prof.emailVerified ? 'البريد مفعّل' : 'البريد غير مفعّل'}</span>
-                        {prof.isBanned ? (
-                          <span className="mr-2 rounded bg-red-100 px-2 py-0.5 font-bold text-red-800">
-                            محظور
-                          </span>
-                        ) : prof.isSuspended ? (
-                          <span className="mr-2 rounded bg-amber-100 px-2 py-0.5 font-bold text-amber-800">
-                            موقوف
-                          </span>
-                        ) : null}
-                      </div>
+                  {profiles
+                    .filter((prof) => {
+                      const q = userSearchQuery.trim().toLowerCase();
+                      if (!q) return true;
+                      return (
+                        prof.fullName.toLowerCase().includes(q) ||
+                        prof.email.toLowerCase().includes(q) ||
+                        (prof.phone || '').includes(q)
+                      );
+                    })
+                    .map((prof) => {
+                      const assignedRole = adminRoles.find((r) => r.userId === prof.id);
+                      const hasProtectedAdminRole = Boolean(
+                        assignedRole &&
+                          (assignedRole.role === AdminRole.SuperAdmin || assignedRole.isActive)
+                      );
+                      const adsCount = userListingCounts[prof.id] ?? 0;
 
-                      {prof.id !== user.id ? (
-                        <div className="flex flex-wrap gap-2">
-                          <button
-                            type="button"
-                            onClick={async () => {
-                              const res = await moderateUserAccount(
-                                prof.id,
-                                !prof.isSuspended,
-                                Boolean(prof.isBanned),
-                                'تحديث إداري'
-                              );
-                              if (res.error) showFeedback('err', res.error);
-                              else {
-                                showFeedback('ok', 'تم تحديث حالة الإيقاف.');
-                                await loadRoleScopedData();
-                              }
-                            }}
-                            className="rounded border border-amber-300 px-2.5 py-1 font-semibold text-amber-900"
-                          >
-                            {prof.isSuspended ? 'رفع الإيقاف' : 'إيقاف مؤقت'}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={async () => {
-                              const res = await moderateUserAccount(
-                                prof.id,
-                                Boolean(prof.isSuspended),
-                                !prof.isBanned,
-                                'تحديث إداري'
-                              );
-                              if (res.error) showFeedback('err', res.error);
-                              else {
-                                showFeedback('ok', 'تم تحديث حالة الحظر.');
-                                await loadRoleScopedData();
-                              }
-                            }}
-                            className="rounded border border-red-300 px-2.5 py-1 font-semibold text-red-700"
-                          >
-                            {prof.isBanned ? 'إلغاء الحظر' : 'حظر نهائي'}
-                          </button>
+                      return (
+                        <div key={prof.id} className="space-y-2.5 py-3.5">
+                          <div className="flex flex-wrap items-start justify-between gap-3">
+                            <div className="space-y-1">
+                              <div className="flex flex-wrap items-center gap-1.5">
+                                <span className="text-sm font-bold text-navy-900">
+                                  {prof.fullName}
+                                </span>
+                                {assignedRole && assignedRole.isActive ? (
+                                  <span className="rounded bg-emerald-100 px-2 py-0.5 text-[11px] font-bold text-emerald-800">
+                                    {ADMIN_ROLE_LABELS[assignedRole.role]}
+                                  </span>
+                                ) : null}
+                                {prof.isBanned ? (
+                                  <span className="rounded bg-red-100 px-2 py-0.5 text-[11px] font-bold text-red-800">
+                                    محظور
+                                  </span>
+                                ) : prof.isSuspended ? (
+                                  <span className="rounded bg-amber-100 px-2 py-0.5 text-[11px] font-bold text-amber-800">
+                                    موقوف
+                                  </span>
+                                ) : (
+                                  <span className="rounded bg-slate-100 px-2 py-0.5 text-[11px] font-semibold text-slate-700">
+                                    نشط
+                                  </span>
+                                )}
+                              </div>
+
+                              <div className="flex flex-wrap gap-x-3 gap-y-1 text-slate-600">
+                                <span dir="ltr" className="font-medium text-navy-900">
+                                  {prof.email}
+                                </span>
+                                <span>
+                                  {prof.emailVerified ? 'البريد مفعّل' : 'البريد غير مفعّل'}
+                                </span>
+                                <span>
+                                  الهاتف:{' '}
+                                  <strong dir="ltr" className="text-navy-900">
+                                    {prof.phone || 'غير مسجل'}
+                                  </strong>
+                                  {prof.phone && prof.phoneVerified ? ' (موثق)' : ''}
+                                </span>
+                                <span>الصفة: {MEMBER_TYPE_LABELS[prof.memberType]}</span>
+                                <span>
+                                  الإعلانات:{' '}
+                                  <strong className="tabular-nums text-navy-900">{adsCount}</strong>
+                                </span>
+                                <span>تاريخ التسجيل: {formatArabicDate(prof.createdAt)}</span>
+                              </div>
+                            </div>
+
+                            {prof.id !== user.id ? (
+                              <div className="flex flex-wrap gap-2">
+                                <button
+                                  type="button"
+                                  onClick={async () => {
+                                    const res = await moderateUserAccount(
+                                      prof.id,
+                                      !prof.isSuspended,
+                                      Boolean(prof.isBanned),
+                                      'تحديث إداري'
+                                    );
+                                    if (res.error) showFeedback('err', res.error);
+                                    else {
+                                      showFeedback('ok', 'تم تحديث حالة الإيقاف.');
+                                      await loadRoleScopedData();
+                                    }
+                                  }}
+                                  className="rounded border border-amber-300 px-2.5 py-1 font-semibold text-amber-900"
+                                >
+                                  {prof.isSuspended ? 'رفع الإيقاف' : 'إيقاف مؤقت'}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={async () => {
+                                    const res = await moderateUserAccount(
+                                      prof.id,
+                                      Boolean(prof.isSuspended),
+                                      !prof.isBanned,
+                                      'تحديث إداري'
+                                    );
+                                    if (res.error) showFeedback('err', res.error);
+                                    else {
+                                      showFeedback('ok', 'تم تحديث حالة الحظر.');
+                                      await loadRoleScopedData();
+                                    }
+                                  }}
+                                  className="rounded border border-red-300 px-2.5 py-1 font-semibold text-red-700"
+                                >
+                                  {prof.isBanned ? 'إلغاء الحظر' : 'حظر نهائي'}
+                                </button>
+                                {isSuperAdmin && !hasProtectedAdminRole ? (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      setConfirmDeleteUserId(
+                                        confirmDeleteUserId === prof.id ? null : prof.id
+                                      )
+                                    }
+                                    className="inline-flex items-center gap-1 rounded border border-red-600 bg-red-50 px-2.5 py-1 font-bold text-red-800 hover:bg-red-100"
+                                  >
+                                    <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+                                    <span>حذف العضو</span>
+                                  </button>
+                                ) : null}
+                              </div>
+                            ) : null}
+                          </div>
+
+                          {isSuperAdmin && confirmDeleteUserId === prof.id ? (
+                            <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-red-200 bg-red-50 p-3 text-red-900">
+                              <span className="font-semibold">
+                                تأكيد الحذف النهائي للعضو ({prof.fullName}) وجميع إعلاناته؟ هذا
+                                الإجراء لا يمكن التراجع عنه.
+                              </span>
+                              <div className="flex gap-2">
+                                <button
+                                  type="button"
+                                  disabled={deletingUserId === prof.id}
+                                  onClick={async () => {
+                                    setDeletingUserId(prof.id);
+                                    const res = await deleteUserAsSuperAdmin(
+                                      prof.id,
+                                      'حذف عضو مخالف من لوحة المدير العام'
+                                    );
+                                    setDeletingUserId(null);
+                                    if (res.error) {
+                                      showFeedback('err', res.error);
+                                    } else {
+                                      setConfirmDeleteUserId(null);
+                                      showFeedback('ok', `تم حذف حساب ${prof.fullName} نهائياً.`);
+                                      await loadRoleScopedData();
+                                    }
+                                  }}
+                                  className="rounded bg-red-700 px-3 py-1 font-bold text-white hover:bg-red-800 disabled:opacity-60"
+                                >
+                                  {deletingUserId === prof.id ? 'جاري الحذف...' : 'نعم، احذف نهائياً'}
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={deletingUserId === prof.id}
+                                  onClick={() => setConfirmDeleteUserId(null)}
+                                  className="rounded border border-slate-300 bg-white px-3 py-1 font-semibold text-navy-900"
+                                >
+                                  إلغاء
+                                </button>
+                              </div>
+                            </div>
+                          ) : null}
                         </div>
-                      ) : null}
-                    </div>
-                  ))}
+                      );
+                    })}
                 </div>
               </section>
             </div>

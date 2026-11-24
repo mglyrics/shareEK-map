@@ -81,6 +81,7 @@ FROM (
     ('bootstrap_first_super_admin'),
     ('protect_last_super_admin'),
     ('reorder_property_media'),
+    ('super_admin_delete_user'),
     ('expire_listings_batch'),
     ('enforce_project_verification_authorization')
 ) AS expected(fn_name)

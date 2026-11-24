@@ -74,6 +74,7 @@ describe('ShareEK Phase 02 - Database Migrations, RLS & Security Verification', 
       '202611210006_seed_locations_and_settings.sql',
       '202611220007_legal_pages_contact_and_rpcs.sql',
       '202611230008_backfill_profiles_role_rpc_and_media_order.sql',
+      '202611240009_super_admin_delete_user.sql',
     ]);
   });
 
@@ -268,7 +269,7 @@ describe('ShareEK Phase 02 - Database Migrations, RLS & Security Verification', 
     );
 
     for (let i = 0; i < migrationFiles.length; i++) {
-      expect(bundleSql).toContain(`SECTION ${i + 1}/8: ${migrationFiles[i]}`);
+      expect(bundleSql).toContain(`SECTION ${i + 1}/9: ${migrationFiles[i]}`);
     }
     expect(bundleSql).toContain("NOTIFY pgrst, 'reload schema';");
     expect(inspectSql).toContain("'contact_messages'");
@@ -276,6 +277,7 @@ describe('ShareEK Phase 02 - Database Migrations, RLS & Security Verification', 
     expect(inspectSql).toContain("'admin_set_admin_role'");
     expect(inspectSql).toContain("'bootstrap_first_super_admin'");
     expect(inspectSql).toContain("'reorder_property_media'");
+    expect(inspectSql).toContain("'super_admin_delete_user'");
 
     // Every table/view and RPC referenced in src/ must exist in migrations
     const srcFiles: string[] = [];
