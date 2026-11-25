@@ -808,11 +808,142 @@ export async function getExportJobsForAdmin(): Promise<{
   };
 }
 
-function renderSummaryReportJpegBlob(stats: ReportsSummaryStats, periodLabel: string): Promise<Blob> {
+export interface PeriodMetrics {
+  newProperties: number;
+  approvedOrders: number;
+  approvedRevenueEgp: number;
+  newReports: number;
+  newUsers: number;
+}
+
+const REPORT_CONTENT_TYPE: Record<DbExportFormat, string> = {
+  jpg: 'image/jpeg',
+  pdf: 'application/pdf',
+};
+
+function asciiBytes(text: string): Uint8Array {
+  const bytes = new Uint8Array(text.length);
+  for (let i = 0; i < text.length; i += 1) {
+    bytes[i] = text.charCodeAt(i) & 0xff;
+  }
+  return bytes;
+}
+
+export function buildPdfBytesFromJpeg(
+  jpegBytes: Uint8Array,
+  imgWidth: number,
+  imgHeight: number
+): Uint8Array<ArrayBuffer> {
+  const pageWidth = 595.28;
+  const pageHeight = 841.89;
+  const contentStream = `q\n${pageWidth} 0 0 ${pageHeight} 0 0 cm\n/Im0 Do\nQ\n`;
+
+  const chunks: Uint8Array[] = [];
+  const offsets: number[] = [];
+  let cursor = 0;
+
+  const pushBytes = (bytes: Uint8Array) => {
+    chunks.push(bytes);
+    cursor += bytes.length;
+  };
+  const pushAscii = (text: string) => pushBytes(asciiBytes(text));
+
+  pushAscii('%PDF-1.4\n%\xE2\xE3\xCF\xD3\n');
+
+  offsets[1] = cursor;
+  pushAscii('1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n');
+
+  offsets[2] = cursor;
+  pushAscii('2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n');
+
+  offsets[3] = cursor;
+  pushAscii(
+    `3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${pageWidth} ${pageHeight}] /Resources << /XObject << /Im0 4 0 R >> >> /Contents 5 0 R >>\nendobj\n`
+  );
+
+  offsets[4] = cursor;
+  pushAscii(
+    `4 0 obj\n<< /Type /XObject /Subtype /Image /Width ${imgWidth} /Height ${imgHeight} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${jpegBytes.length} >>\nstream\n`
+  );
+  pushBytes(jpegBytes);
+  pushAscii('\nendstream\nendobj\n');
+
+  offsets[5] = cursor;
+  pushAscii(
+    `5 0 obj\n<< /Length ${contentStream.length} >>\nstream\n${contentStream}endstream\nendobj\n`
+  );
+
+  const xrefOffset = cursor;
+  pushAscii('xref\n0 6\n0000000000 65535 f \n');
+  for (let i = 1; i <= 5; i += 1) {
+    pushAscii(`${String(offsets[i]).padStart(10, '0')} 00000 n \n`);
+  }
+  pushAscii(`trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`);
+
+  const output = new Uint8Array(new ArrayBuffer(cursor));
+  let writeAt = 0;
+  for (const chunk of chunks) {
+    output.set(chunk, writeAt);
+    writeAt += chunk.length;
+  }
+  return output;
+}
+
+async function fetchPeriodMetrics(
+  periodStart?: string,
+  periodEnd?: string
+): Promise<PeriodMetrics | null> {
+  if (!supabase || (!periodStart && !periodEnd)) return null;
+
+  const startIso = periodStart ? `${periodStart}T00:00:00.000Z` : null;
+  const endIso = periodEnd ? `${periodEnd}T23:59:59.999Z` : null;
+
+  let propQ = supabase.from('properties').select('id', { count: 'exact', head: true });
+  let repQ = supabase.from('reports').select('id', { count: 'exact', head: true });
+  let profQ = supabase.from('profiles').select('id', { count: 'exact', head: true });
+  let ordQ = supabase
+    .from('payment_orders')
+    .select('amount_egp')
+    .eq('status', 'approved');
+
+  if (startIso) {
+    propQ = propQ.gte('created_at', startIso);
+    repQ = repQ.gte('created_at', startIso);
+    profQ = profQ.gte('created_at', startIso);
+    ordQ = ordQ.gte('created_at', startIso);
+  }
+  if (endIso) {
+    propQ = propQ.lte('created_at', endIso);
+    repQ = repQ.lte('created_at', endIso);
+    profQ = profQ.lte('created_at', endIso);
+    ordQ = ordQ.lte('created_at', endIso);
+  }
+
+  const [propRes, repRes, profRes, ordRes] = await Promise.all([propQ, repQ, profQ, ordQ]);
+  const orders = ordRes.data ?? [];
+  const approvedRevenueEgp = orders.reduce((sum, row) => sum + Number(row.amount_egp || 0), 0);
+
+  return {
+    newProperties: propRes.count ?? 0,
+    approvedOrders: orders.length,
+    approvedRevenueEgp,
+    newReports: repRes.count ?? 0,
+    newUsers: profRes.count ?? 0,
+  };
+}
+
+function renderSummaryReportJpegBlob(
+  stats: ReportsSummaryStats,
+  periodLabel: string,
+  format: DbExportFormat,
+  periodMetrics: PeriodMetrics | null
+): Promise<{ blob: Blob; width: number; height: number }> {
   return new Promise((resolve, reject) => {
     const canvas = document.createElement('canvas');
-    canvas.width = 1200;
-    canvas.height = 760;
+    const isPdf = format === 'pdf';
+    canvas.width = isPdf ? 1240 : 1200;
+    canvas.height = isPdf ? 1754 : periodMetrics ? 1240 : 820;
+
     const ctx = canvas.getContext('2d');
     if (!ctx) {
       reject(new Error('Canvas not supported'));
@@ -822,53 +953,181 @@ function renderSummaryReportJpegBlob(stats: ReportsSummaryStats, periodLabel: st
     ctx.fillStyle = '#ffffff';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
+    // Header band
     ctx.fillStyle = '#0f172a';
-    ctx.fillRect(0, 0, canvas.width, 130);
+    ctx.fillRect(0, 0, canvas.width, 150);
+
+    ctx.fillStyle = '#10b981';
+    ctx.fillRect(0, 144, canvas.width, 6);
 
     ctx.fillStyle = '#ffffff';
     ctx.font = 'bold 34px sans-serif';
     ctx.textAlign = 'right';
-    ctx.fillText('ShareEK - شريك العقاري | ملخص تقارير المنصة', 1140, 62);
-    ctx.font = '20px sans-serif';
-    ctx.fillStyle = '#cbd5e1';
-    ctx.fillText(`تاريخ التصدير: ${new Date().toLocaleDateString('ar-EG')} — ${periodLabel}`, 1140, 102);
+    ctx.fillText('ShareEK - شريك العقاري | تقرير ملخص أداء المنصة', canvas.width - 60, 66);
 
-    const rows = [
+    ctx.font = '22px sans-serif';
+    ctx.fillStyle = '#cbd5e1';
+    ctx.fillText(
+      `تاريخ الإصدار: ${new Date().toLocaleDateString('ar-EG')} — النطاق الزمني: ${periodLabel}`,
+      canvas.width - 60,
+      112
+    );
+
+    const drawSectionRows = (
+      title: string,
+      rows: [string, string][],
+      startY: number
+    ): number => {
+      ctx.fillStyle = '#0f172a';
+      ctx.font = 'bold 26px sans-serif';
+      ctx.textAlign = 'right';
+      ctx.fillText(title, canvas.width - 60, startY);
+
+      let y = startY + 56;
+      for (const [label, value] of rows) {
+        ctx.fillStyle = '#f8fafc';
+        ctx.fillRect(60, y - 44, canvas.width - 120, 68);
+        ctx.strokeStyle = '#cbd5e1';
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(60, y - 44, canvas.width - 120, 68);
+
+        ctx.fillStyle = '#0f172a';
+        ctx.font = 'bold 24px sans-serif';
+        ctx.textAlign = 'right';
+        ctx.fillText(label, canvas.width - 90, y);
+
+        ctx.fillStyle = '#059669';
+        ctx.textAlign = 'left';
+        ctx.fillText(value, 90, y);
+        y += 82;
+      }
+      return y;
+    };
+
+    const platformRows: [string, string][] = [
       ['الإعلانات المنشورة النشطة', String(stats.published_properties)],
       ['الإعلانات بانتظار المراجعة', String(stats.pending_properties)],
       ['الإعلانات المنتهية', String(stats.expired_properties)],
-      ['طلبات الدفع المعتمدة', String(stats.approved_payment_orders_count)],
-      ['إجمالي الإيرادات المعتمدة (ج.م)', String(stats.approved_revenue_egp)],
-      ['البلاغات المفتوحة', String(stats.open_reports_count)],
+      ['إجمالي طلبات الدفع المعتمدة', String(stats.approved_payment_orders_count)],
+      [
+        'إجمالي الإيرادات المعتمدة (ج.م)',
+        Number(stats.approved_revenue_egp).toLocaleString('en-US'),
+      ],
+      ['البلاغات المفتوحة حالياً', String(stats.open_reports_count)],
     ];
 
-    let y = 210;
-    for (const [label, value] of rows) {
-      ctx.fillStyle = '#f8fafc';
-      ctx.fillRect(60, y - 42, 1080, 70);
-      ctx.strokeStyle = '#cbd5e1';
-      ctx.strokeRect(60, y - 42, 1080, 70);
+    let nextY = drawSectionRows('أولاً: المؤشرات الإجمالية للمنصة', platformRows, 215);
 
-      ctx.fillStyle = '#0f172a';
-      ctx.font = 'bold 24px sans-serif';
-      ctx.textAlign = 'right';
-      ctx.fillText(label, 1110, y);
-
-      ctx.fillStyle = '#059669';
-      ctx.textAlign = 'left';
-      ctx.fillText(value, 90, y);
-      y += 86;
+    if (periodMetrics) {
+      const periodRows: [string, string][] = [
+        ['الإعلانات المضافة خلال الفترة', String(periodMetrics.newProperties)],
+        ['طلبات الدفع المعتمدة خلال الفترة', String(periodMetrics.approvedOrders)],
+        [
+          'الإيرادات المعتمدة خلال الفترة (ج.م)',
+          periodMetrics.approvedRevenueEgp.toLocaleString('en-US'),
+        ],
+        ['البلاغات الواردة خلال الفترة', String(periodMetrics.newReports)],
+        ['الأعضاء المسجلون خلال الفترة', String(periodMetrics.newUsers)],
+      ];
+      nextY = drawSectionRows(`ثانياً: مؤشرات الفترة (${periodLabel})`, periodRows, nextY + 36);
     }
+
+    // Footer
+    ctx.strokeStyle = '#e2e8f0';
+    ctx.beginPath();
+    ctx.moveTo(60, canvas.height - 76);
+    ctx.lineTo(canvas.width - 60, canvas.height - 76);
+    ctx.stroke();
+
+    ctx.fillStyle = '#64748b';
+    ctx.font = '18px sans-serif';
+    ctx.textAlign = 'right';
+    ctx.fillText(
+      'تقرير إداري داخلي — منصة شريك العقاري (ShareEK) | للاستخدام الإداري المصرح به فقط',
+      canvas.width - 60,
+      canvas.height - 38
+    );
 
     canvas.toBlob(
       (blob) => {
         if (!blob) reject(new Error('Failed to create report image'));
-        else resolve(blob);
+        else resolve({ blob, width: canvas.width, height: canvas.height });
       },
       'image/jpeg',
       0.92
     );
   });
+}
+
+async function generateAndUploadReportFile(payload: {
+  jobId: string;
+  userId: string;
+  format: DbExportFormat;
+  periodStart?: string | null;
+  periodEnd?: string | null;
+  stats: ReportsSummaryStats;
+}): Promise<{ error: string | null }> {
+  if (!supabase) return { error: 'Supabase غير مهيأ.' };
+
+  const start = payload.periodStart || undefined;
+  const end = payload.periodEnd || undefined;
+  const periodLabel =
+    start || end ? `من ${start || 'البداية'} إلى ${end || 'الآن'}` : 'كامل الفترة';
+
+  try {
+    const periodMetrics = await fetchPeriodMetrics(start, end);
+    const { blob: jpegBlob, width, height } = await renderSummaryReportJpegBlob(
+      payload.stats,
+      periodLabel,
+      payload.format,
+      periodMetrics
+    );
+
+    let uploadBlob: Blob = jpegBlob;
+    if (payload.format === 'pdf') {
+      const jpegBytes = new Uint8Array(await jpegBlob.arrayBuffer());
+      const pdfBytes = buildPdfBytesFromJpeg(jpegBytes, width, height);
+      uploadBlob = new Blob([pdfBytes], { type: 'application/pdf' });
+    }
+
+    const storagePath = `${payload.userId}/${payload.jobId}.${payload.format}`;
+    const { error: upErr } = await supabase.storage
+      .from('admin-reports')
+      .upload(storagePath, uploadBlob, {
+        contentType: REPORT_CONTENT_TYPE[payload.format],
+        upsert: true,
+      });
+
+    if (upErr) {
+      await supabase
+        .from('export_jobs')
+        .update({ status: 'failed', error_message: upErr.message })
+        .eq('id', payload.jobId);
+      return { error: `تعذر رفع ملف التقرير: ${upErr.message}` };
+    }
+
+    const { error: updErr } = await supabase
+      .from('export_jobs')
+      .update({
+        status: 'completed',
+        storage_path: storagePath,
+        error_message: null,
+      })
+      .eq('id', payload.jobId);
+
+    if (updErr) {
+      return { error: `تم رفع الملف ولكن تعذر تحديث حالة الطلب: ${updErr.message}` };
+    }
+
+    return { error: null };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'تعذر توليد ملف التقرير في المتصفح.';
+    await supabase
+      .from('export_jobs')
+      .update({ status: 'failed', error_message: msg })
+      .eq('id', payload.jobId);
+    return { error: msg };
+  }
 }
 
 export async function createExportReportJob(payload: {
@@ -879,8 +1138,15 @@ export async function createExportReportJob(payload: {
   periodStart?: string;
   periodEnd?: string;
   stats: ReportsSummaryStats | null;
-}): Promise<{ error: string | null }> {
-  if (!supabase) return { error: 'Supabase غير مهيأ.' };
+}): Promise<{ error: string | null; completedImmediately: boolean }> {
+  if (!supabase) return { error: 'Supabase غير مهيأ.', completedImmediately: false };
+
+  if (payload.periodStart && payload.periodEnd && payload.periodEnd < payload.periodStart) {
+    return {
+      error: 'تاريخ نهاية الفترة يجب أن يكون مساوياً أو بعد تاريخ البداية.',
+      completedImmediately: false,
+    };
+  }
 
   const { data: created, error: insertErr } = await supabase
     .from('export_jobs')
@@ -896,36 +1162,54 @@ export async function createExportReportJob(payload: {
     .single();
 
   if (insertErr || !created) {
-    return { error: insertErr?.message ?? 'تعذر تسجيل طلب التصدير.' };
+    return {
+      error: insertErr?.message ?? 'تعذر تسجيل طلب التصدير.',
+      completedImmediately: false,
+    };
   }
 
-  // Admin/super_admin can also generate and upload an immediate JPG snapshot to admin-reports
+  // Admin/super_admin generate and upload immediate JPG or PDF snapshots to admin-reports
   if (
     (payload.role === AdminRole.SuperAdmin || payload.role === AdminRole.Admin) &&
-    payload.format === 'jpg' &&
     payload.stats
   ) {
-    try {
-      const periodLabel = payload.periodStart
-        ? `${payload.periodStart} إلى ${payload.periodEnd || 'الآن'}`
-        : 'كامل الفترة';
-      const blob = await renderSummaryReportJpegBlob(payload.stats, periodLabel);
-      const storagePath = `${payload.userId}/${created.id}.jpg`;
-
-      const { error: upErr } = await supabase.storage
-        .from('admin-reports')
-        .upload(storagePath, blob, { contentType: 'image/jpeg', upsert: false });
-
-      if (!upErr) {
-        await supabase
-          .from('export_jobs')
-          .update({ status: 'completed', storage_path: storagePath })
-          .eq('id', created.id);
-      }
-    } catch {
-      // Leave job queued if browser canvas export is unavailable
+    const genRes = await generateAndUploadReportFile({
+      jobId: created.id,
+      userId: payload.userId,
+      format: payload.format,
+      periodStart: payload.periodStart,
+      periodEnd: payload.periodEnd,
+      stats: payload.stats,
+    });
+    if (genRes.error) {
+      return { error: genRes.error, completedImmediately: false };
     }
+    return { error: null, completedImmediately: true };
   }
 
-  return { error: null };
+  return { error: null, completedImmediately: false };
+}
+
+export async function completeQueuedExportJob(payload: {
+  job: ExportJobRecord;
+  userId: string;
+  role: AdminRole;
+  stats: ReportsSummaryStats | null;
+}): Promise<{ error: string | null }> {
+  if (!supabase) return { error: 'Supabase غير مهيأ.' };
+  if (payload.role !== AdminRole.SuperAdmin && payload.role !== AdminRole.Admin) {
+    return { error: 'فقط المدير العام أو مدير المنصة يمكنه إكمال التصدير.' };
+  }
+  if (!payload.stats) {
+    return { error: 'إحصاءات المنصة غير محملة بعد، حاول تحديث الصفحة.' };
+  }
+
+  return generateAndUploadReportFile({
+    jobId: payload.job.id,
+    userId: payload.userId,
+    format: payload.job.format,
+    periodStart: payload.job.periodStart,
+    periodEnd: payload.job.periodEnd,
+    stats: payload.stats,
+  });
 }

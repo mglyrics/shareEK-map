@@ -26,6 +26,7 @@ import type {
 import {
   approvePaymentOrder,
   assignOrUpdateAdminRole,
+  completeQueuedExportJob,
   createExportReportJob,
   deleteUserAsSuperAdmin,
   getActiveAdminRole,
@@ -149,6 +150,7 @@ export const AdminDashboardPage: React.FC = () => {
   const [exportPeriodStart, setExportPeriodStart] = useState('');
   const [exportPeriodEnd, setExportPeriodEnd] = useState('');
   const [exporting, setExporting] = useState(false);
+  const [completingExportJobId, setCompletingExportJobId] = useState<string | null>(null);
 
   // Super Admin Role assignment & user management state
   const [roleTargetUserId, setRoleTargetUserId] = useState('');
@@ -364,6 +366,9 @@ export const AdminDashboardPage: React.FC = () => {
     e.preventDefault();
     if (!user || !verifiedRole) return;
     setFeedback(null);
+    if (exportPeriodStart && exportPeriodEnd && exportPeriodEnd < exportPeriodStart) {
+      return showFeedback('err', 'تاريخ نهاية الفترة يجب أن يكون مساوياً أو بعد تاريخ البداية.');
+    }
     setExporting(true);
     const res = await createExportReportJob({
       userId: user.id,
@@ -376,7 +381,28 @@ export const AdminDashboardPage: React.FC = () => {
     });
     setExporting(false);
     if (res.error) return showFeedback('err', res.error);
-    showFeedback('ok', 'تم تسجيل طلب تصدير التقرير في النظام.');
+    showFeedback(
+      'ok',
+      res.completedImmediately
+        ? 'تم إنشاء التقرير وتجهيزه للتنزيل بنجاح.'
+        : 'تم تسجيل طلب تصدير التقرير في قائمة الانتظار.'
+    );
+    await loadRoleScopedData();
+  };
+
+  const handleCompleteQueuedExport = async (job: ExportJobRecord) => {
+    if (!user || !verifiedRole) return;
+    setFeedback(null);
+    setCompletingExportJobId(job.id);
+    const res = await completeQueuedExportJob({
+      job,
+      userId: user.id,
+      role: verifiedRole,
+      stats,
+    });
+    setCompletingExportJobId(null);
+    if (res.error) return showFeedback('err', res.error);
+    showFeedback('ok', 'تم استخراج التقرير وتجهيز رابط التنزيل بنجاح.');
     await loadRoleScopedData();
   };
 
@@ -543,31 +569,46 @@ export const AdminDashboardPage: React.FC = () => {
                     تصدير التقارير الدورية (PDF / JPG)
                   </h2>
                 </div>
-                <div className="grid grid-cols-1 gap-3 sm:grid-cols-4">
-                  <select
-                    value={exportFormat}
-                    onChange={(e) => setExportFormat(e.target.value as DbExportFormat)}
-                    className="h-10 rounded-lg border border-slate-300 px-3 text-xs"
-                  >
-                    <option value="jpg">صورة ملخصة (JPG فورية)</option>
-                    <option value="pdf">تقرير PDF (في قائمة التصدير)</option>
-                  </select>
-                  <input
-                    type="date"
-                    value={exportPeriodStart}
-                    onChange={(e) => setExportPeriodStart(e.target.value)}
-                    className="h-10 rounded-lg border border-slate-300 px-3 text-xs"
-                  />
-                  <input
-                    type="date"
-                    value={exportPeriodEnd}
-                    onChange={(e) => setExportPeriodEnd(e.target.value)}
-                    className="h-10 rounded-lg border border-slate-300 px-3 text-xs"
-                  />
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-4 sm:items-end">
+                  <div>
+                    <label className="mb-1 block text-[11px] font-semibold text-slate-600">
+                      صيغة التقرير
+                    </label>
+                    <select
+                      value={exportFormat}
+                      onChange={(e) => setExportFormat(e.target.value as DbExportFormat)}
+                      className="h-10 w-full rounded-lg border border-slate-300 bg-white px-3 text-xs text-slate-900"
+                    >
+                      <option value="jpg">صورة ملخصة (JPG فوري)</option>
+                      <option value="pdf">تقرير طباعة (PDF فوري)</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="mb-1 block text-[11px] font-semibold text-slate-600">
+                      من تاريخ (اختياري)
+                    </label>
+                    <input
+                      type="date"
+                      value={exportPeriodStart}
+                      onChange={(e) => setExportPeriodStart(e.target.value)}
+                      className="h-10 w-full rounded-lg border border-slate-300 bg-white px-3 text-xs text-slate-900"
+                    />
+                  </div>
+                  <div>
+                    <label className="mb-1 block text-[11px] font-semibold text-slate-600">
+                      إلى تاريخ (اختياري)
+                    </label>
+                    <input
+                      type="date"
+                      value={exportPeriodEnd}
+                      onChange={(e) => setExportPeriodEnd(e.target.value)}
+                      className="h-10 w-full rounded-lg border border-slate-300 bg-white px-3 text-xs text-slate-900"
+                    />
+                  </div>
                   <button
                     type="submit"
                     disabled={exporting}
-                    className="h-10 rounded-lg bg-emerald-600 px-4 text-xs font-bold text-white hover:bg-emerald-700"
+                    className="h-10 w-full rounded-lg bg-emerald-600 px-4 text-xs font-bold text-white hover:bg-emerald-700 disabled:opacity-60"
                   >
                     {exporting ? 'جاري التجهيز...' : 'إنشاء تقرير جديد'}
                   </button>
@@ -575,28 +616,79 @@ export const AdminDashboardPage: React.FC = () => {
 
                 {exportJobs.length > 0 ? (
                   <div className="mt-4 divide-y divide-slate-100 text-xs">
-                    {exportJobs.map((job) => (
-                      <div key={job.id} className="flex flex-wrap items-center justify-between gap-2 py-2.5">
-                        <div>
-                          <span className="font-bold text-navy-900">
-                            {job.reportType} ({job.format.toUpperCase()})
-                          </span>{' '}
-                          · <span className="text-slate-600">{job.status}</span> ·{' '}
-                          {formatArabicDate(job.createdAt)}
+                    {exportJobs.map((job) => {
+                      const statusMeta =
+                        job.status === 'completed'
+                          ? { label: 'مكتمل', cls: 'bg-emerald-50 text-emerald-800 border-emerald-200' }
+                          : job.status === 'failed'
+                            ? { label: 'فشل التصدير', cls: 'bg-red-50 text-red-700 border-red-200' }
+                            : job.status === 'processing'
+                              ? { label: 'جاري التجهيز', cls: 'bg-blue-50 text-blue-700 border-blue-200' }
+                              : { label: 'قيد الانتظار', cls: 'bg-amber-50 text-amber-800 border-amber-200' };
+                      const reportTitle =
+                        job.reportType === 'platform_summary'
+                          ? 'ملخص أداء المنصة'
+                          : job.reportType;
+                      const periodNote =
+                        job.periodStart || job.periodEnd
+                          ? `الفترة: ${job.periodStart || 'البداية'} ← ${job.periodEnd || 'الآن'}`
+                          : 'كامل الفترة';
+
+                      return (
+                        <div
+                          key={job.id}
+                          className="flex flex-wrap items-center justify-between gap-2 py-3"
+                        >
+                          <div className="space-y-1">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="font-bold text-navy-900">
+                                {reportTitle} ({job.format.toUpperCase()})
+                              </span>
+                              <span
+                                className={`rounded border px-2 py-0.5 text-[11px] font-semibold ${statusMeta.cls}`}
+                              >
+                                {statusMeta.label}
+                              </span>
+                            </div>
+                            <div className="text-[11px] text-slate-600">
+                              {periodNote} · {formatArabicDate(job.createdAt)}
+                            </div>
+                            {job.errorMessage ? (
+                              <div className="text-[11px] text-red-600">{job.errorMessage}</div>
+                            ) : null}
+                          </div>
+
+                          <div className="flex flex-wrap items-center gap-2">
+                            {job.signedUrl ? (
+                              <a
+                                href={job.signedUrl}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                download={`${job.reportType}-${job.id.slice(0, 8)}.${job.format}`}
+                                className="inline-flex items-center gap-1 rounded-lg bg-navy-900 px-3 py-1.5 font-bold text-white hover:bg-navy-800"
+                              >
+                                <Download className="h-3.5 w-3.5" />
+                                <span>تنزيل التقرير</span>
+                              </a>
+                            ) : isFullAdmin && (job.status === 'queued' || job.status === 'failed') ? (
+                              <button
+                                type="button"
+                                disabled={completingExportJobId === job.id}
+                                onClick={() => void handleCompleteQueuedExport(job)}
+                                className="inline-flex items-center gap-1 rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-1.5 font-bold text-emerald-800 hover:bg-emerald-100 disabled:opacity-60"
+                              >
+                                <Download className="h-3.5 w-3.5" />
+                                <span>
+                                  {completingExportJobId === job.id
+                                    ? 'جاري الاستخراج...'
+                                    : 'استخراج وتجهيز الآن'}
+                                </span>
+                              </button>
+                            ) : null}
+                          </div>
                         </div>
-                        {job.signedUrl ? (
-                          <a
-                            href={job.signedUrl}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="inline-flex items-center gap-1 rounded bg-navy-900 px-3 py-1 font-bold text-white"
-                          >
-                            <Download className="h-3.5 w-3.5" />
-                            <span>تنزيل التقرير</span>
-                          </a>
-                        ) : null}
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 ) : null}
               </form>
