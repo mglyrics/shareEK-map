@@ -1095,7 +1095,7 @@ async function generateAndUploadReportFile(payload: {
       .from('admin-reports')
       .upload(storagePath, uploadBlob, {
         contentType: REPORT_CONTENT_TYPE[payload.format],
-        upsert: true,
+        upsert: false,
       });
 
     if (upErr) {
@@ -1212,4 +1212,38 @@ export async function completeQueuedExportJob(payload: {
     periodEnd: payload.job.periodEnd,
     stats: payload.stats,
   });
+}
+
+export async function deleteExportReportAsSuperAdmin(payload: {
+  job: ExportJobRecord;
+  role: AdminRole;
+}): Promise<{ error: string | null }> {
+  if (!supabase) return { error: 'Supabase غير مهيأ.' };
+  if (payload.role !== AdminRole.SuperAdmin) {
+    return { error: 'صلاحية حذف التقارير مقتصرة على المدير العام (Super Admin) فقط.' };
+  }
+
+  if (payload.job.storagePath) {
+    const { error: storageErr } = await supabase.storage
+      .from('admin-reports')
+      .remove([payload.job.storagePath]);
+    if (storageErr) {
+      return { error: `تعذر حذف ملف التقرير من التخزين: ${storageErr.message}` };
+    }
+  }
+
+  const { data: deletedRows, error: dbErr } = await supabase
+    .from('export_jobs')
+    .delete()
+    .eq('id', payload.job.id)
+    .select('id');
+
+  if (dbErr) {
+    return { error: dbErr.message };
+  }
+  if (!deletedRows || deletedRows.length === 0) {
+    return { error: 'تعذر حذف سجل التقرير؛ تأكد من تطبيق صلاحيات السوبر أدمن في قاعدة البيانات.' };
+  }
+
+  return { error: null };
 }

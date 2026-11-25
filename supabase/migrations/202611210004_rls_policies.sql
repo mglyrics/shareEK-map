@@ -510,7 +510,7 @@ CREATE POLICY "admin_logs_select_admins"
 
 DROP POLICY IF EXISTS "admin_logs_insert_admins" ON public.admin_logs;
 
--- 14. export_jobs (reports_viewer can view and queue exports; only super_admin/admin may modify/delete)
+-- 14. export_jobs (reports_viewer can view and queue exports; super_admin/admin may update; ONLY super_admin may delete)
 DROP POLICY IF EXISTS "export_jobs_manage_admins" ON public.export_jobs;
 DROP POLICY IF EXISTS "export_jobs_select_admins" ON public.export_jobs;
 CREATE POLICY "export_jobs_select_admins"
@@ -552,7 +552,7 @@ CREATE POLICY "export_jobs_delete_super_admin"
   ON public.export_jobs FOR DELETE
   TO authenticated
   USING (
-    public.has_admin_role(auth.uid(), ARRAY['super_admin', 'admin']::public.admin_role_enum[])
+    public.has_admin_role(auth.uid(), ARRAY['super_admin']::public.admin_role_enum[])
   );
 
 -- 15. site_settings (Public read only for safe storefront keys; super_admin/admin full access)

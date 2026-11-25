@@ -10,7 +10,7 @@
 
 BEGIN;
 -- ============================================================================
--- SECTION 1/9: 202611210001_extensions_and_enums.sql
+-- SECTION 1/10: 202611210001_extensions_and_enums.sql
 -- ============================================================================
 
 -- ShareEK - شريك العقاري
@@ -168,7 +168,7 @@ END;
 $$;
 
 -- ============================================================================
--- SECTION 2/9: 202611210002_core_tables.sql
+-- SECTION 2/10: 202611210002_core_tables.sql
 -- ============================================================================
 
 -- ShareEK - شريك العقاري
@@ -891,7 +891,7 @@ BEGIN
 END $$;
 
 -- ============================================================================
--- SECTION 3/9: 202611210003_auth_and_lifecycle_functions.sql
+-- SECTION 3/10: 202611210003_auth_and_lifecycle_functions.sql
 -- ============================================================================
 
 -- ShareEK - شريك العقاري
@@ -2479,7 +2479,7 @@ REVOKE ALL ON public.public_advertiser_summary FROM PUBLIC;
 GRANT SELECT ON public.public_advertiser_summary TO anon, authenticated;
 
 -- ============================================================================
--- SECTION 4/9: 202611210004_rls_policies.sql
+-- SECTION 4/10: 202611210004_rls_policies.sql
 -- ============================================================================
 
 -- ShareEK - شريك العقاري
@@ -3036,7 +3036,7 @@ CREATE POLICY "export_jobs_delete_super_admin"
   ON public.export_jobs FOR DELETE
   TO authenticated
   USING (
-    public.has_admin_role(auth.uid(), ARRAY['super_admin', 'admin']::public.admin_role_enum[])
+    public.has_admin_role(auth.uid(), ARRAY['super_admin']::public.admin_role_enum[])
   );
 
 -- 15. site_settings (Public read only for safe storefront keys; super_admin/admin full access)
@@ -3061,7 +3061,7 @@ CREATE POLICY "site_settings_manage_admin"
   );
 
 -- ============================================================================
--- SECTION 5/9: 202611210005_storage_buckets_and_policies.sql
+-- SECTION 5/10: 202611210005_storage_buckets_and_policies.sql
 -- ============================================================================
 
 -- ShareEK - شريك العقاري
@@ -3306,11 +3306,11 @@ CREATE POLICY "admin_reports_delete_admins"
   TO authenticated
   USING (
     bucket_id = 'admin-reports'
-    AND public.has_admin_role(auth.uid(), ARRAY['super_admin', 'admin']::public.admin_role_enum[])
+    AND public.has_admin_role(auth.uid(), ARRAY['super_admin']::public.admin_role_enum[])
   );
 
 -- ============================================================================
--- SECTION 6/9: 202611210006_seed_locations_and_settings.sql
+-- SECTION 6/10: 202611210006_seed_locations_and_settings.sql
 -- ============================================================================
 
 -- ShareEK - شريك العقاري
@@ -3455,7 +3455,7 @@ ON CONFLICT (key) DO NOTHING;
 -- Refresh PostgREST schema cache immediately after applying migrations
 
 -- ============================================================================
--- SECTION 7/9: 202611220007_legal_pages_contact_and_rpcs.sql
+-- SECTION 7/10: 202611220007_legal_pages_contact_and_rpcs.sql
 -- ============================================================================
 
 -- ShareEK - شريك العقاري
@@ -3917,7 +3917,7 @@ REVOKE ALL ON FUNCTION public.admin_set_user_moderation(uuid, boolean, boolean, 
 GRANT EXECUTE ON FUNCTION public.admin_set_user_moderation(uuid, boolean, boolean, timestamptz, text) TO authenticated;
 
 -- ============================================================================
--- SECTION 8/9: 202611230008_backfill_profiles_role_rpc_and_media_order.sql
+-- SECTION 8/10: 202611230008_backfill_profiles_role_rpc_and_media_order.sql
 -- ============================================================================
 
 -- ShareEK - شريك العقاري
@@ -4397,7 +4397,7 @@ REVOKE ALL ON FUNCTION public.reorder_property_media(uuid, uuid[]) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.reorder_property_media(uuid, uuid[]) TO authenticated;
 
 -- ============================================================================
--- SECTION 9/9: 202611240009_super_admin_delete_user.sql
+-- SECTION 9/10: 202611240009_super_admin_delete_user.sql
 -- ============================================================================
 
 -- ShareEK - شريك العقاري
@@ -4542,6 +4542,27 @@ $$;
 
 REVOKE ALL ON FUNCTION public.super_admin_delete_user(uuid, text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.super_admin_delete_user(uuid, text) TO authenticated;
+
+-- ============================================================================
+-- SECTION 10/10: 202611250010_super_admin_only_delete_export_reports.sql
+-- ============================================================================
+
+DROP POLICY IF EXISTS "export_jobs_delete_super_admin" ON public.export_jobs;
+CREATE POLICY "export_jobs_delete_super_admin"
+  ON public.export_jobs FOR DELETE
+  TO authenticated
+  USING (
+    public.has_admin_role(auth.uid(), ARRAY['super_admin']::public.admin_role_enum[])
+  );
+
+DROP POLICY IF EXISTS "admin_reports_delete_admins" ON storage.objects;
+CREATE POLICY "admin_reports_delete_admins"
+  ON storage.objects FOR DELETE
+  TO authenticated
+  USING (
+    bucket_id = 'admin-reports'
+    AND public.has_admin_role(auth.uid(), ARRAY['super_admin']::public.admin_role_enum[])
+  );
 
 COMMIT;
 

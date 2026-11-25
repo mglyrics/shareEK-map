@@ -28,6 +28,7 @@ import {
   assignOrUpdateAdminRole,
   completeQueuedExportJob,
   createExportReportJob,
+  deleteExportReportAsSuperAdmin,
   deleteUserAsSuperAdmin,
   getActiveAdminRole,
   getAdminLogs,
@@ -151,6 +152,8 @@ export const AdminDashboardPage: React.FC = () => {
   const [exportPeriodEnd, setExportPeriodEnd] = useState('');
   const [exporting, setExporting] = useState(false);
   const [completingExportJobId, setCompletingExportJobId] = useState<string | null>(null);
+  const [confirmDeleteExportJobId, setConfirmDeleteExportJobId] = useState<string | null>(null);
+  const [deletingExportJobId, setDeletingExportJobId] = useState<string | null>(null);
 
   // Super Admin Role assignment & user management state
   const [roleTargetUserId, setRoleTargetUserId] = useState('');
@@ -403,6 +406,18 @@ export const AdminDashboardPage: React.FC = () => {
     setCompletingExportJobId(null);
     if (res.error) return showFeedback('err', res.error);
     showFeedback('ok', 'تم استخراج التقرير وتجهيز رابط التنزيل بنجاح.');
+    await loadRoleScopedData();
+  };
+
+  const handleDeleteExportJob = async (job: ExportJobRecord) => {
+    if (!verifiedRole || verifiedRole !== AdminRole.SuperAdmin) return;
+    setFeedback(null);
+    setDeletingExportJobId(job.id);
+    const res = await deleteExportReportAsSuperAdmin({ job, role: verifiedRole });
+    setDeletingExportJobId(null);
+    setConfirmDeleteExportJobId(null);
+    if (res.error) return showFeedback('err', res.error);
+    showFeedback('ok', 'تم حذف التقرير وملفه بنجاح.');
     await loadRoleScopedData();
   };
 
@@ -684,6 +699,38 @@ export const AdminDashboardPage: React.FC = () => {
                                     : 'استخراج وتجهيز الآن'}
                                 </span>
                               </button>
+                            ) : null}
+
+                            {isSuperAdmin ? (
+                              confirmDeleteExportJobId === job.id ? (
+                                <div className="inline-flex items-center gap-1.5 rounded-lg border border-red-200 bg-red-50 px-2 py-1">
+                                  <button
+                                    type="button"
+                                    disabled={deletingExportJobId === job.id}
+                                    onClick={() => void handleDeleteExportJob(job)}
+                                    className="rounded bg-red-600 px-2.5 py-1 text-[11px] font-bold text-white hover:bg-red-700 disabled:opacity-60"
+                                  >
+                                    {deletingExportJobId === job.id ? 'جاري الحذف...' : 'تأكيد الحذف'}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    disabled={deletingExportJobId === job.id}
+                                    onClick={() => setConfirmDeleteExportJobId(null)}
+                                    className="rounded border border-slate-300 bg-white px-2 py-1 text-[11px] font-semibold text-slate-700 hover:bg-slate-50"
+                                  >
+                                    إلغاء
+                                  </button>
+                                </div>
+                              ) : (
+                                <button
+                                  type="button"
+                                  onClick={() => setConfirmDeleteExportJobId(job.id)}
+                                  className="inline-flex items-center gap-1 rounded-lg border border-red-200 bg-white px-2.5 py-1.5 font-bold text-red-700 hover:bg-red-50"
+                                >
+                                  <Trash2 className="h-3.5 w-3.5" />
+                                  <span>حذف</span>
+                                </button>
+                              )
                             ) : null}
                           </div>
                         </div>

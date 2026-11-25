@@ -19,6 +19,7 @@ const MIGRATION_FILES = [
   '202611220007_legal_pages_contact_and_rpcs.sql',
   '202611230008_backfill_profiles_role_rpc_and_media_order.sql',
   '202611240009_super_admin_delete_user.sql',
+  '202611250010_super_admin_only_delete_export_reports.sql',
 ] as const;
 
 type RoleActor =
@@ -1637,6 +1638,75 @@ describe('ShareEK Isolated Clean PostgreSQL Engine: Sequential Migrations, RLS, 
       `SELECT action FROM public.admin_logs WHERE action = 'super_admin_delete_user' AND target_id = '${uSpammer}';`
     );
     expect(deletionLogs).toHaveLength(1);
+
+    await db.close();
+  }, 30_000);
+
+  it('14. restricts deletion of export_jobs and admin-reports storage objects strictly to super_admin', async () => {
+    const db = new PGlite({ extensions: { pgcrypto, pg_trgm } });
+    await db.waitReady;
+    await setupSupabaseCompatShim(db);
+    for (const file of MIGRATION_FILES) {
+      await db.exec(fs.readFileSync(path.join(MIGRATIONS_DIR, file), 'utf8'));
+    }
+    await grantDefaultSupabaseTablePrivileges(db);
+
+    const uSuper = '50000000-0000-4000-8000-000000000001';
+    const uAdmin = '50000000-0000-4000-8000-000000000002';
+    const uReportsViewer = '50000000-0000-4000-8000-000000000003';
+    const uBuyer = '50000000-0000-4000-8000-000000000004';
+    const jobId = '60000000-0000-4000-8000-000000000001';
+    const filePath = `${uAdmin}/${jobId}.pdf`;
+
+    await db.exec(`
+      INSERT INTO auth.users (id, email, raw_user_meta_data, email_confirmed_at)
+      VALUES
+        ('${uSuper}', 'super_rep@share-ek.com', '{"full_name":"سوبر أدمن","phone":"01000000011","member_type":"owner"}', now()),
+        ('${uAdmin}', 'admin_rep@share-ek.com', '{"full_name":"أدمن","phone":"01000000012","member_type":"owner"}', now()),
+        ('${uReportsViewer}', 'rv_rep@share-ek.com', '{"full_name":"عارض تقارير","phone":"01000000013","member_type":"owner"}', now()),
+        ('${uBuyer}', 'buyer_rep@share-ek.com', '{"full_name":"مستخدم","phone":"01000000014","member_type":"buyer"}', now());
+
+      INSERT INTO public.admin_roles (user_id, role, assigned_by, is_active)
+      VALUES
+        ('${uSuper}', 'super_admin', '${uSuper}', true),
+        ('${uAdmin}', 'admin', '${uSuper}', true),
+        ('${uReportsViewer}', 'reports_viewer', '${uSuper}', true);
+
+      INSERT INTO public.export_jobs (id, requested_by, report_type, format, status, storage_path)
+      VALUES ('${jobId}', '${uAdmin}', 'platform_summary', 'pdf', 'completed', '${filePath}');
+
+      INSERT INTO storage.objects (bucket_id, name, owner)
+      VALUES ('admin-reports', '${filePath}', '${uAdmin}');
+    `);
+
+    // admin, reports_viewer, buyer, and anon CANNOT delete from export_jobs or admin-reports
+    for (const actor of [
+      { kind: 'anon' as const },
+      { kind: 'authenticated' as const, uid: uBuyer },
+      { kind: 'authenticated' as const, uid: uReportsViewer },
+      { kind: 'authenticated' as const, uid: uAdmin },
+    ]) {
+      const { rows: delJobs } = await asActor(db, actor, (tx) =>
+        tx.query(`DELETE FROM public.export_jobs WHERE id = '${jobId}' RETURNING id;`)
+      );
+      expect(delJobs).toHaveLength(0);
+
+      const { rows: delFiles } = await asActor(db, actor, (tx) =>
+        tx.query(`DELETE FROM storage.objects WHERE bucket_id = 'admin-reports' AND name = '${filePath}' RETURNING name;`)
+      );
+      expect(delFiles).toHaveLength(0);
+    }
+
+    // super_admin CAN delete both the storage object and the export_jobs row
+    const { rows: superDelFile } = await asActor(db, { kind: 'authenticated', uid: uSuper }, (tx) =>
+      tx.query(`DELETE FROM storage.objects WHERE bucket_id = 'admin-reports' AND name = '${filePath}' RETURNING name;`)
+    );
+    expect(superDelFile).toHaveLength(1);
+
+    const { rows: superDelJob } = await asActor(db, { kind: 'authenticated', uid: uSuper }, (tx) =>
+      tx.query(`DELETE FROM public.export_jobs WHERE id = '${jobId}' RETURNING id;`)
+    );
+    expect(superDelJob).toHaveLength(1);
 
     await db.close();
   }, 30_000);

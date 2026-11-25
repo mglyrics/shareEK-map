@@ -240,5 +240,5 @@ CREATE POLICY "admin_reports_delete_admins"
   TO authenticated
   USING (
     bucket_id = 'admin-reports'
-    AND public.has_admin_role(auth.uid(), ARRAY['super_admin', 'admin']::public.admin_role_enum[])
+    AND public.has_admin_role(auth.uid(), ARRAY['super_admin']::public.admin_role_enum[])
   );

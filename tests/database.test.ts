@@ -75,6 +75,7 @@ describe('ShareEK Phase 02 - Database Migrations, RLS & Security Verification', 
       '202611220007_legal_pages_contact_and_rpcs.sql',
       '202611230008_backfill_profiles_role_rpc_and_media_order.sql',
       '202611240009_super_admin_delete_user.sql',
+      '202611250010_super_admin_only_delete_export_reports.sql',
     ]);
   });
 
@@ -269,7 +270,7 @@ describe('ShareEK Phase 02 - Database Migrations, RLS & Security Verification', 
     );
 
     for (let i = 0; i < migrationFiles.length; i++) {
-      expect(bundleSql).toContain(`SECTION ${i + 1}/9: ${migrationFiles[i]}`);
+      expect(bundleSql).toContain(`SECTION ${i + 1}/10: ${migrationFiles[i]}`);
     }
     expect(bundleSql).toContain("NOTIFY pgrst, 'reload schema';");
     expect(inspectSql).toContain("'contact_messages'");
